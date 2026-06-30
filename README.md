@@ -51,6 +51,37 @@ x86-64 / arm64 including Jetson and Raspberry Pi builds), then its Python
 package. Put the host NIC on the cameras' subnet and enable jumbo frames if your
 switch supports them. `record_daq.py` does **not** need the Arena SDK.
 
+## Hardware requirements
+
+These scripts do **no image processing** — they just move raw data to disk — so
+CPU load is low. What matters is the device interface, a bit of RAM, and (for
+cameras) write speed. The two scripts have very different needs.
+
+**DAQ recording (`record_daq.py`)** — tiny footprint: a few hundred small
+readings per second, parsed and written to SQLite.
+
+| | Recommendation |
+|---|---|
+| **Minimum** | Python 3.8+, ~256 MB free RAM, and the sensor's interface (USB for DAQ-U, Bluetooth LE for DAQ-M, Ethernet for DAQ-E). A **Raspberry Pi Zero 2 W** handles it. |
+| **Ideal** | Any Raspberry Pi 4 / 5 or Jetson — far more than enough. |
+
+**Camera capture (`capture_lattice.py`)** — the demanding one. The Arena SDK
+sets a hard floor: it ships only for **64-bit ARM (aarch64) and x86-64** (no
+32-bit / ARMv6 / ARMv7 build), and the cameras are wired Gigabit Ethernet.
+
+| | Recommendation |
+|---|---|
+| **Minimum** | A **64-bit OS** on 64-bit ARM or x86-64, Gigabit Ethernet (onboard, or a USB-to-Gigabit adapter — available for essentially every platform; use a USB 3 port for full bandwidth, since USB 2.0 caps ~480 Mbps), ~1 GB free RAM for one camera (budget ≈70 MB more per additional camera for frame buffers). Board floor: **Raspberry Pi 4 (2 GB+) on 64-bit Raspberry Pi OS / Ubuntu.** A microSD card is fine for a single camera at low frame rates. |
+| **Ideal** | **NVIDIA Jetson Orin Nano / NX / AGX** (or an x86-64 mini-PC), 4 GB+ RAM, with an **SSD** (USB 3 / NVMe). Arrays need the SSD: frames are uncompressed (~6.3 MB each), so e.g. 5 cameras at 2 fps is ~60 MB/s of sustained writes a microSD card can't keep up with. |
+
+> **A Raspberry Pi Zero cannot run the cameras** — it's ARMv6, which the Arena
+> SDK doesn't support. (A board without onboard Ethernet can always add it with
+> a USB-Gigabit adapter, but that doesn't get around the ARMv6 limitation.) The
+> smallest practical camera host is a Raspberry Pi 4 on a 64-bit OS; a Jetson is
+> the smoothest ARM path and matches what most users already fly. Storage and
+> network bandwidth both scale with camera count × frame rate, so step up to a
+> Jetson or x86-64 host for larger arrays.
+
 ## Usage — `capture_lattice.py` (cameras)
 
 ```bash
