@@ -1,6 +1,7 @@
 """
 selftest.py -- self-contained checks that this project's output matches what
-Chloros reads on import. Needs only numpy + Pillow (no Chloros source required).
+Chloros reads on import. Needs only numpy + Pillow; `pip install tifffile` adds
+the full set of TIFF read-back checks.
 
 Two halves:
   1. Metadata contract: write a raw LATTICE TIFF (M3C + M3M) and a DAQ .daq,
@@ -16,6 +17,7 @@ Run:  python selftest.py
 import io
 import math
 import os
+import shutil
 import sqlite3
 import struct
 import sys
@@ -26,14 +28,28 @@ import numpy as np
 import mapir_metadata as mm
 import record_daq as R
 
+try:
+    import tifffile
+    HAVE_TIFFFILE = True
+except ImportError:  # only needed to read TIFFs back the way Chloros does
+    tifffile = None
+    HAVE_TIFFFILE = False
+
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_selftest_out")
+shutil.rmtree(OUT, ignore_errors=True)  # start each run from a clean output dir
 os.makedirs(OUT, exist_ok=True)
 RESULTS = []
+SKIPPED = []
 
 
 def check(name, cond, detail=""):
     RESULTS.append(bool(cond))
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  -- {detail}" if detail else ""))
+
+
+def skip(name, reason):
+    SKIPPED.append(name)
+    print(f"  [SKIP] {name}  -- {reason}")
 
 
 # ===========================================================================
@@ -58,8 +74,7 @@ def chloros_is_lattice(path):  # verbatim: project.py:_is_lattice_image_path
 
 def chloros_exif_context(path):  # verbatim core: tasks.py:_lattice_exif_context
     out = {}
-    import tifffile as _tf
-    with _tf.TiffFile(path) as t:
+    with tifffile.TiffFile(path) as t:
         pg = t.pages[0]
         ex = pg.tags.get(34665)
         exd = ex.value if (ex is not None and isinstance(ex.value, dict)) else {}
@@ -114,25 +129,31 @@ def test_metadata_contract():
     mm.write_lattice_raw_tiff(pc, m3c, model="LATT-M3C-L41-FRGN",
                               serial="213602328", exposure_s=0.005, iso=100)
     check("M3C detected as LATTICE", chloros_is_lattice(pc))
-    c = chloros_exif_context(pc)
-    check("M3C serial (cal key)", c.get('serial') == "213602328", c.get('serial'))
-    check("M3C model", c.get('model') == "LATT-M3C-L41-FRGN")
-    check("M3C BayerRG12", c.get('pixel_format') == 'BayerRG12')
-    check("M3C exposure ~5000us", abs(c.get('exp_us', 0) - 5000) < 1, c.get('exp_us'))
-    check("M3C gain 0dB", abs(c.get('gain_db', 9)) < 1e-6)
-    import tifffile
-    check("M3C raw pixels intact", np.array_equal(tifffile.imread(pc), m3c))
     check("M3C filename groups trigger", "_0001_" in os.path.basename(pc))
+    if HAVE_TIFFFILE:
+        c = chloros_exif_context(pc)
+        check("M3C serial (cal key)", c.get('serial') == "213602328", c.get('serial'))
+        check("M3C model", c.get('model') == "LATT-M3C-L41-FRGN")
+        check("M3C BayerRG12", c.get('pixel_format') == 'BayerRG12')
+        check("M3C exposure ~5000us", abs(c.get('exp_us', 0) - 5000) < 1, c.get('exp_us'))
+        check("M3C gain 0dB", abs(c.get('gain_db', 9)) < 1e-6)
+        check("M3C raw pixels intact", np.array_equal(tifffile.imread(pc), m3c))
+    else:
+        skip("M3C EXIF + pixel checks", "pip install tifffile to read TIFFs back")
 
     # M3M mono
     m3m = (np.random.rand(1536, 2048) * 4095).astype(np.uint16)
     pm = os.path.join(OUT, mm.lattice_capture_filename("213609999", 1))
     mm.write_lattice_raw_tiff(pm, m3m, model="LATT-M3M-L41-F850",
                               serial="213609999", exposure_s=0.002, iso=200)
-    cm = chloros_exif_context(pm)
-    check("M3M Mono12", cm.get('pixel_format') == 'Mono12')
-    check("M3M serial", cm.get('serial') == "213609999")
-    check("M3M exposure ~2000us", abs(cm.get('exp_us', 0) - 2000) < 1)
+    check("M3M detected as LATTICE", chloros_is_lattice(pm))
+    if HAVE_TIFFFILE:
+        cm = chloros_exif_context(pm)
+        check("M3M Mono12", cm.get('pixel_format') == 'Mono12')
+        check("M3M serial", cm.get('serial') == "213609999")
+        check("M3M exposure ~2000us", abs(cm.get('exp_us', 0) - 2000) < 1)
+    else:
+        skip("M3M EXIF checks", "pip install tifffile")
 
     # DAQ .daq
     pd = os.path.join(OUT, "test.daq")
@@ -360,10 +381,13 @@ def test_camera_capture_flow():
     check("a TIFF was written", len(tiffs) == 1, tiffs)
     p = os.path.join(_Args.output_dir, tiffs[0])
     check("capture TIFF detected as LATTICE", chloros_is_lattice(p))
-    ctx = chloros_exif_context(p)
-    check("capture TIFF serial (cal key)", ctx.get("serial") == "213602328", ctx.get("serial"))
-    check("capture TIFF model", ctx.get("model") == "LATT-M3C-L41-FRGN")
-    check("capture TIFF exposure ~4000us", abs(ctx.get("exp_us", 0) - 4000) < 1, ctx.get("exp_us"))
+    if HAVE_TIFFFILE:
+        ctx = chloros_exif_context(p)
+        check("capture TIFF serial (cal key)", ctx.get("serial") == "213602328", ctx.get("serial"))
+        check("capture TIFF model", ctx.get("model") == "LATT-M3C-L41-FRGN")
+        check("capture TIFF exposure ~4000us", abs(ctx.get("exp_us", 0) - 4000) < 1, ctx.get("exp_us"))
+    else:
+        skip("capture TIFF EXIF checks", "pip install tifffile")
 
 
 def main():
@@ -374,6 +398,9 @@ def main():
     test_camera_capture_flow()
     n = sum(RESULTS)
     print(f"\n==== {n}/{len(RESULTS)} checks passed ====")
+    if SKIPPED:
+        print(f"     ({len(SKIPPED)} TIFF read-back check group(s) skipped -- "
+              f"`pip install tifffile` to run the full self-test)")
     return 0 if n == len(RESULTS) else 1
 
 

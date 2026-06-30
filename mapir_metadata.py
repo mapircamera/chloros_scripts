@@ -242,6 +242,12 @@ class DaqWriter:
                 "product_serial is required -- it is the calibration fetch "
                 "key. Read it from the sensor (get_sensor_id).")
         self._path = path
+        # Each DaqWriter starts a fresh recording. If the path already exists,
+        # replace it -- the tables can't be created over an existing database
+        # (you'd get "table als_meta already exists"). record_daq's default
+        # filename is timestamped, so this only matters if you reuse --output.
+        if os.path.exists(path):
+            os.remove(path)
         self._conn = sqlite3.connect(path)
         cur = self._conn.cursor()
         cur.execute(_ALS_META_DDL)

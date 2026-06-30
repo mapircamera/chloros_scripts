@@ -137,7 +137,8 @@ upward-facing (downwelling) and run it for the whole flight.
   reads on import, and that the DAQ wire codec and camera configuration are
   correct. Run it any time: `python selftest.py`.
 
-## License
+## License & support
 
-[MIT](LICENSE). Provided as-is, with no warranty. Not an official MAPIR product
-or support channel.
+MIT licensed (see [LICENSE](LICENSE)); provided as-is, without warranty. For help
+with MAPIR hardware or Chloros, contact
+[MAPIR support](https://www.mapir.camera/community/contact).
