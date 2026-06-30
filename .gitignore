@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Captured/test output
+out/
+*.tiff
+*.tif
+*.daq
+!docs/**/*.tif
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

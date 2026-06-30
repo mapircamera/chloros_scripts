@@ -1,0 +1,18 @@
+# chloros_scripts -- DIY capture reference for MAPIR LATTICE + DAQ
+#
+# Pure-Python, cross-platform (Windows, Linux x86_64/arm64 incl. Jetson &
+# Raspberry Pi). Install with:  pip install -r requirements.txt
+
+numpy>=1.21
+Pillow>=9.1          # raw LATTICE TIFF + EXIF (mapir_metadata.py)
+pyserial>=3.5        # DAQ-U  (USB serial)
+bleak>=0.20          # DAQ-M  (Bluetooth LE)
+
+# DAQ-E (Ethernet) uses only the Python standard library (sockets) -- no
+# extra dependency.
+#
+# CAMERAS (capture_lattice.py) require the Arena SDK and its `arena_api` Python
+# wrapper. arena_api is NOT installable from PyPI alone -- it needs the native
+# Arena SDK for your OS/arch first.
+# See README.md ("Cameras / Arena SDK"). It is intentionally NOT listed here
+# so `pip install -r requirements.txt` works for the DAQ-only use case.
