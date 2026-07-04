@@ -151,6 +151,14 @@ upward-facing (downwelling) and run it for the whole flight.
   recording to imagery **by timestamp**. Record a DAQ during the flight and keep
   the host clock reasonably accurate (the scripts stamp absolute UTC time). With
   no DAQ you still get radiance, not reflectance.
+- **Timezone is declared, not guessed.** Naive wall-clock stamps are ambiguous,
+  so the TIFFs carry EXIF `OffsetTimeOriginal = +00:00` and the `.daq` carries
+  `als_meta.utc_offset_minutes = 0` (schema v1.23) — the scripts stamp UTC
+  everywhere, and say so. Chloros reads the declarations, so image↔DAQ matching
+  works on any processing host with **no** 'Light sensor timezone offset'
+  setting (the same contract the MAPIR CM5 hub stamps). If you adapt the
+  scripts to stamp local time, update both declarations (see
+  `mapir_metadata.py`).
 - **Raw means raw.** Spectra are the sensor's raw firmware output (no
   calibration); `calibration_applied = 0` tells Chloros to calibrate on import.
 

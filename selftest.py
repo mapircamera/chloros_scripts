@@ -7,7 +7,8 @@ Two halves:
   1. Metadata contract: write a raw LATTICE TIFF (M3C + M3M) and a DAQ .daq,
      then read them back with VERBATIM copies of the Chloros import readers
      (project.py:_is_lattice_image_path, tasks.py:_lattice_exif_context, and
-     mip/daq_dls.py's als_meta/als_log reads). A pass means the files round-trip.
+     mip/daq_dls.py's als_meta/als_log reads + image_utc_offset_s timezone
+     declaration). A pass means the files round-trip.
   2. DAQ wire codec: build synthetic device packets to the documented byte
      layout and parse them with record_daq.py's codec, plus a full
      connect->acquire flow against a simulated device.
@@ -104,12 +105,49 @@ def chloros_exif_context(path):  # verbatim core: tasks.py:_lattice_exif_context
     return out
 
 
+def chloros_image_utc_offset(path):  # verbatim core: mip/daq_dls.py
+    # image_utc_offset_s + _parse_exif_utc_offset -- the image-side timezone
+    # declaration Chloros prefers when matching imagery to a .daq by time.
+    import re as _re
+
+    def _parse(value):
+        s = str(value or "").strip()
+        if not s:
+            return None
+        if s.upper() == "Z":
+            return 0.0
+        m = _re.fullmatch(r'([+-])(\d{1,2}):?(\d{2})', s)
+        if not m:
+            return None
+        sign = -1.0 if m.group(1) == "-" else 1.0
+        hh, mm = int(m.group(2)), int(m.group(3))
+        if hh > 14 or mm > 59:
+            return None
+        return sign * (hh * 3600.0 + mm * 60.0)
+
+    with tifffile.TiffFile(path) as t:
+        ex = t.pages[0].tags.get(34665)
+        exd = ex.value if (ex is not None and isinstance(ex.value, dict)) else {}
+        for k in ("OffsetTimeOriginal", "OffsetTimeDigitized", "OffsetTime",
+                  36881, 36882, 36880):
+            if k in exd:
+                off = _parse(exd[k])
+                if off is not None:
+                    return off
+    return None
+
+
 def chloros_read_daq(path):  # verbatim shape: mip/daq_dls.py meta + als_log read
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        m = conn.execute(
-            "SELECT product_model, product_serial, calibration_applied "
-            "FROM als_meta LIMIT 1").fetchone()
+        # Read-by-name with a per-column presence check, like read_daq_meta --
+        # utc_offset_minutes exists only in v1.23+ recordings.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(als_meta)")}
+        wanted = [c for c in ("version", "product_model", "product_serial",
+                              "calibration_applied", "utc_offset_minutes")
+                  if c in cols]
+        m = dict(zip(wanted, conn.execute(
+            "SELECT %s FROM als_meta LIMIT 1" % ", ".join(wanted)).fetchone()))
         rows = conn.execute(
             "SELECT precise_timestamp, spectral_data, is_saturated, integration_time "
             "FROM als_log WHERE event_type=3 AND precise_timestamp IS NOT NULL "
@@ -117,8 +155,11 @@ def chloros_read_daq(path):  # verbatim shape: mip/daq_dls.py meta + als_log rea
     finally:
         conn.close()
     specs = [(ts, np.load(io.BytesIO(b)), sat, it) for ts, b, sat, it in rows]
-    return {'product_model': m[0], 'product_serial': m[1],
-            'calibration_applied': bool(m[2])}, specs
+    return {'version': m.get('version'),
+            'product_model': m.get('product_model'),
+            'product_serial': m.get('product_serial'),
+            'calibration_applied': bool(m.get('calibration_applied')),
+            'utc_offset_minutes': m.get('utc_offset_minutes')}, specs
 
 
 def test_metadata_contract():
@@ -137,6 +178,8 @@ def test_metadata_contract():
         check("M3C BayerRG12", c.get('pixel_format') == 'BayerRG12')
         check("M3C exposure ~5000us", abs(c.get('exp_us', 0) - 5000) < 1, c.get('exp_us'))
         check("M3C gain 0dB", abs(c.get('gain_db', 9)) < 1e-6)
+        check("M3C declares UTC (OffsetTimeOriginal +00:00)",
+              chloros_image_utc_offset(pc) == 0.0)
         check("M3C raw pixels intact", np.array_equal(tifffile.imread(pc), m3c))
     else:
         skip("M3C EXIF + pixel checks", "pip install tifffile to read TIFFs back")
@@ -166,6 +209,9 @@ def test_metadata_contract():
     check("daq product_model", meta['product_model'] == 'daq-u')
     check("daq serial (cal key)", meta['product_serial'] == 'AA-BB-CC-DD-EE')
     check("daq calibration_applied=0", meta['calibration_applied'] is False)
+    check("daq als_meta v1.23", meta['version'] == '1.23', meta['version'])
+    check("daq declares UTC stamps (utc_offset_minutes=0)",
+          meta['utc_offset_minutes'] == 0, meta['utc_offset_minutes'])
     check("daq readings recovered", len(specs) == 15)
     check("daq spectrum float32 x135", specs[0][1].dtype == np.float32 and specs[0][1].size == 135)
 
@@ -386,6 +432,8 @@ def test_camera_capture_flow():
         check("capture TIFF serial (cal key)", ctx.get("serial") == "213602328", ctx.get("serial"))
         check("capture TIFF model", ctx.get("model") == "LATT-M3C-L41-FRGN")
         check("capture TIFF exposure ~4000us", abs(ctx.get("exp_us", 0) - 4000) < 1, ctx.get("exp_us"))
+        check("capture TIFF declares UTC (OffsetTimeOriginal +00:00)",
+              chloros_image_utc_offset(p) == 0.0)
     else:
         skip("capture TIFF EXIF checks", "pip install tifffile")
 

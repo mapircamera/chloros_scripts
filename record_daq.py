@@ -457,7 +457,11 @@ def build_sensor(args):
 
 
 def default_output(kind):
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # UTC, matching every other naive wall-clock these scripts write (the
+    # capture TIFF filenames/EXIF and the .daq's stamped utc_offset_minutes=0
+    # declaration). A local-time name here would misdescribe the recording's
+    # declared timezone -- the exact mixed-clock bug the CM5 hub once had.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"{kind}_{stamp}.daq"
 
 

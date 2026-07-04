@@ -22,6 +22,14 @@ Two outputs:
   * DaqWriter(...)              -> a .daq SQLite file Chloros matches to the
     imagery by timestamp and calibrates by serial.
 
+Timezone contract (so reflectance matching works on ANY processing host):
+naive wall-clock stamps are ambiguous, so both outputs DECLARE their zone --
+the TIFF via EXIF OffsetTimeOriginal ("+00:00" for the default UTC capture
+time) and the .daq via als_meta.utc_offset_minutes (v1.23; 0 = UTC). This is
+the same convention the MAPIR CM5 hub stamps; without it Chloros would parse
+the naive stamps in the processing host's local zone and the operator would
+have to configure a manual 'Light sensor timezone offset'.
+
 Verified by validate_contract.py, which round-trips the output through
 verbatim copies of the actual Chloros reader functions.
 """
@@ -47,7 +55,36 @@ _TAG_EXIF_IFD = 0x8769             # 34665 pointer to the EXIF sub-IFD
 _TAG_EXPOSURE_TIME = 0x829A        # 33434 EXIF sub-IFD (RATIONAL, seconds)
 _TAG_ISO = 0x8827                  # 34855 EXIF sub-IFD (SHORT)
 _TAG_DATETIME_ORIGINAL = 0x9003    # 36867 EXIF sub-IFD
+_TAG_OFFSET_ORIGINAL = 0x9011      # 36881 EXIF sub-IFD ("+00:00"; tz of
+                                   #       DateTimeOriginal -- see below)
 _TAG_SUBSEC_ORIGINAL = 0x9291      # 37521 EXIF sub-IFD (microseconds, as text)
+
+
+def _utc_offset_string(when):
+    """EXIF ``OffsetTime*`` string ("+HH:MM") for *when*'s timezone.
+
+    Timezone-aware datetimes report their own offset (the default UTC
+    capture time -> "+00:00"); a naive datetime is taken as HOST-LOCAL time
+    (Python's convention for a bare ``datetime.now()``) and reports the
+    host zone at that instant, DST included.
+    """
+    off = (when if when.tzinfo is not None else when.astimezone()).utcoffset()
+    total = int(round((off.total_seconds() if off is not None else 0) / 60.0))
+    sign = "-" if total < 0 else "+"
+    return f"{sign}{abs(total) // 60:02d}:{abs(total) % 60:02d}"
+
+
+def utc_offset_minutes(when=None):
+    """Signed minutes east of UTC for *when* (default: host-local now).
+
+    This is the value ``DaqWriter`` stamps into ``als_meta.utc_offset_minutes``
+    -- the ONE field Chloros checks to know what timezone a recording
+    system's naive wall-clock stamps (filenames, EXIF DateTime) are in.
+    These scripts stamp UTC everywhere, so their recordings carry 0.
+    """
+    when = when or datetime.now().astimezone()
+    off = (when if when.tzinfo is not None else when.astimezone()).utcoffset()
+    return int(round((off.total_seconds() if off is not None else 0) / 60.0))
 
 
 # ===========================================================================
@@ -111,7 +148,12 @@ def write_lattice_raw_tiff(path, pixels, *, model, serial,
         Use 100 for 0 dB gain (the common scientific-capture case).
     when : datetime
         Capture time (UTC recommended). Defaults to now. Stamped as
-        DateTimeOriginal + SubSecTimeOriginal.
+        DateTimeOriginal + SubSecTimeOriginal, PLUS OffsetTimeOriginal
+        declaring the timestamp's timezone ("+00:00" for the default UTC).
+        Chloros reads the declaration, so DAQ<->image reflectance matching
+        works on any processing host with no manual 'Light sensor timezone
+        offset' -- the same contract the MAPIR CM5 hub stamps (fw >= 1.4.1).
+        A NAIVE `when` is taken as host-local time and declared as such.
 
     Note on compression: the TIFF is written UNCOMPRESSED. Pillow's in-TIFF
     DEFLATE/LZW paths go through libtiff, which cannot co-write the EXIF
@@ -144,6 +186,12 @@ def write_lattice_raw_tiff(path, pixels, *, model, serial,
     sub[_TAG_EXPOSURE_TIME] = float(exposure_s)
     sub[_TAG_ISO] = int(iso)
     sub[_TAG_DATETIME_ORIGINAL] = when.strftime("%Y:%m:%d %H:%M:%S")
+    # Declare the timestamp's timezone (EXIF 2.31). DateTimeOriginal above is
+    # a NAIVE wall-clock string; without this tag Chloros must assume a zone
+    # when matching the image to a .daq by time (host-local by default --
+    # wrong by the UTC offset for these UTC-stamped captures on most hosts).
+    # "+00:00" here makes the image side self-describing.
+    sub[_TAG_OFFSET_ORIGINAL] = _utc_offset_string(when)
     sub[_TAG_SUBSEC_ORIGINAL] = f"{when.microsecond:06d}"
 
     # Uncompressed only -- see the compression note in the docstring. The
@@ -179,7 +227,8 @@ _ALS_META_DDL = """CREATE TABLE als_meta(
     calibration_bundle_sha TEXT,
     calibration_completed_utc TEXT,
     cap_id TEXT,
-    cap_applied INTEGER)"""
+    cap_applied INTEGER,
+    utc_offset_minutes INTEGER)"""
 
 # Full als_log schema (matches the MAPIR recorder). A DIY raw recorder only
 # fills event_type / precise_timestamp / spectral_data / is_saturated /
@@ -228,10 +277,25 @@ class DaqWriter:
                           bare sensor. Recorded raw (cap_applied=0); Chloros
                           applies it at import. Leave 'none' unless MAPIR told
                           you a specific cap id.
+    tz_offset_minutes : int
+                          Timezone provenance (als_meta v1.23): the UTC
+                          offset, in signed minutes, of the NAIVE wall-clock
+                          stamps your capture system writes (image/daq
+                          filenames, EXIF DateTime). It is the ONE field
+                          Chloros checks to line the .daq up with imagery on
+                          any processing host -- no manual 'Light sensor
+                          timezone offset' setting. These scripts stamp UTC
+                          everywhere, so the default is 0 (same convention as
+                          the MAPIR CM5 hub). If you adapt them to stamp
+                          LOCAL time instead, pass
+                          ``utc_offset_minutes()`` (this module) so the
+                          declaration stays truthful. The spectrum timestamps
+                          themselves (``timestamp_ns``) are absolute epochs
+                          and are NOT affected by this value.
     """
 
     def __init__(self, path, *, product_model, product_serial,
-                 device_name="", cap_id="none"):
+                 device_name="", cap_id="none", tz_offset_minutes=0):
         kind = str(product_model).strip().lower()
         if kind not in _VALID_KINDS:
             raise ValueError(
@@ -254,13 +318,17 @@ class DaqWriter:
         cur.execute(_ALS_LOG_DDL)
         # Raw recording: empty calibration sha -> calibration_applied = 0 so
         # Chloros calibrates at import by serial. cap recorded but not applied.
+        # v1.23: utc_offset_minutes declares the timezone of the capture
+        # system's naive wall-clock stamps (0 = UTC, this project's
+        # convention) so Chloros needs no manual timezone setting.
         cur.execute(
             "INSERT INTO als_meta (version, product_model, product_serial, "
             "device_name, calibration_applied, calibration_bundle_sha, "
-            "calibration_completed_utc, cap_id, cap_applied) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            ("1.22", kind, str(product_serial).strip(), str(device_name),
-             0, "", "", (cap_id or "none"), 0))
+            "calibration_completed_utc, cap_id, cap_applied, "
+            "utc_offset_minutes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("1.23", kind, str(product_serial).strip(), str(device_name),
+             0, "", "", (cap_id or "none"), 0, int(tz_offset_minutes)))
         self._conn.commit()
         self._count = 0
 
