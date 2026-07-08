@@ -1,7 +1,7 @@
 # chloros_scripts
 
 Reference Python scripts for **capturing raw data from MAPIR LATTICE cameras
-and DAQ light sensors with your own flight computer**, then processing it in
+and DAQ light sensors with your own computer**, then processing it in
 [Chloros](https://www.mapir.camera/collections/software/products/chloros) afterward.
 
 These are deliberately small, dependency-light, and heavily commented — meant
