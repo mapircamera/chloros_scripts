@@ -10,9 +10,22 @@ protocol directly over the three transports:
     DAQ-M : Bluetooth LE     (bleak, Nordic UART Service)
     DAQ-E : Ethernet         (stdlib sockets: JSON control + raw TCP)
 
-It records the sensor's RAW firmware-output spectrum (no calibration applied)
-and stamps the .daq so Chloros fetches this sensor's factory calibration from
-the cloud BY SERIAL and applies it at import. You capture; Chloros calibrates.
+By default it records the sensor's RAW firmware-output spectrum (no
+calibration applied) and stamps the .daq so Chloros fetches this sensor's
+factory calibration from the cloud BY SERIAL and applies it at import. You
+capture; Chloros calibrates.
+
+DAQ-E can also calibrate with no cloud and no Chloros at all. The device
+carries its own factory bundle in flash, so ``--calibrate`` pulls it down
+over ethernet and applies it locally (see daq_cal.py):
+
+    --calibrate off    raw only. The default; unchanged behaviour.
+    --calibrate csv    .daq stays RAW, plus a sibling .csv of calibrated
+                       spectral irradiance in W/m^2/nm. Recommended: you get
+                       usable numbers now and the .daq stays reprocessable.
+    --calibrate bake   calibrated values go INTO the .daq, stamped with the
+                       bundle sha. Self-contained, but frozen -- a future
+                       bundle revision can no longer be applied to it.
 
 Usage
 -----
@@ -20,6 +33,7 @@ Usage
     python record_daq.py u --port /dev/ttyUSB0 --integration-time 50 --frames 100
     python record_daq.py m --mac AA:BB:CC:DD:EE:FF
     python record_daq.py e --host 192.168.1.50 --duration 300
+    python record_daq.py e --host 192.168.1.50 --calibrate csv
 
 Press Ctrl-C to stop. Output defaults to ./<kind>_<timestamp>.daq.
 
@@ -33,6 +47,7 @@ Protocol summary (NSP32-style, all transports share it)
 """
 
 import argparse
+import csv
 import io
 import os
 import signal
@@ -44,6 +59,15 @@ import time
 from datetime import datetime, timezone
 
 from mapir_metadata import DaqWriter
+
+# DAQ-E JSON control channel (TCP 5001): reads the sensor's name (its
+# calibration serial) and firmware at connect, and -- with --calibrate --
+# pulls the onboard bundle and profiles.
+#
+# Shared with daq_cal rather than duplicated here: that implementation reads
+# in 64 KB blocks rather than a byte at a time, which matters because
+# get_calibration returns a single 5-30 KB line.
+from daq_cal import DaqEControlClient as DaqEControl
 
 # ---------------------------------------------------------------------------
 # Wire protocol  (shared by all transports)
@@ -321,33 +345,7 @@ class BleTransport:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
 
-class DaqEControl:
-    """DAQ-E JSON control channel (TCP 5001). Used only to read the sensor's
-    name (its calibration serial) and firmware at connect."""
-
-    def __init__(self, host, port=5001, timeout=3.0):
-        self._sock = socket.create_connection((host, port), timeout=timeout)
-        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self._sock.settimeout(timeout)
-        self._lock = threading.Lock()
-
-    def cmd(self, obj):
-        import json
-        with self._lock:
-            self._sock.sendall((json.dumps(obj) + "\n").encode())
-            buf = bytearray()
-            while True:
-                ch = self._sock.recv(1)
-                if not ch or ch == b"\n":
-                    break
-                buf += ch
-            return json.loads(buf.decode())
-
-    def close(self):
-        try:
-            self._sock.close()
-        except Exception:
-            pass
+# (DaqEControl lives in daq_cal -- imported at the top of this module.)
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +488,33 @@ def main(argv=None):
                    help="stop after N seconds (0 = until Ctrl-C)")
     p.add_argument("--output", help="output .daq path (default <kind>_<ts>.daq)")
     p.add_argument("--device-name", default="", help="free-text label")
+    p.add_argument("--calibrate", choices=["off", "csv", "bake"], default="off",
+                   help="DAQ-E only: apply the bundle stored on the device "
+                        "itself, with no cloud and no Chloros. 'csv' keeps the "
+                        ".daq raw and writes calibrated W/m^2/nm alongside; "
+                        "'bake' writes calibrated values into the .daq "
+                        "(self-contained but no longer reprocessable). "
+                        "Default 'off' (raw only).")
+    p.add_argument("--csv", metavar="PATH",
+                   help="explicit path for --calibrate csv output "
+                        "(default: the .daq path with a .csv suffix)")
+    p.add_argument("--cap-id",
+                   help="override the cap profile id the device reports "
+                        "(e.g. sunshine_cosine, fov_45, none, as_recorded)")
+    p.add_argument("--require-profiles", action="store_true",
+                   help="with --calibrate, fail unless the device carries cap/"
+                        "geometry profiles. Use when a cap IS fitted: without "
+                        "a profile the output is bare-uncorrected, which for a "
+                        "sunshine cap is wrong by roughly 30x.")
     args = p.parse_args(argv)
+
+    if args.calibrate != "off" and args.device != "e":
+        raise SystemExit(
+            "--calibrate needs the onboard bundle store, which only DAQ-E "
+            "has. For DAQ-U / DAQ-M, record raw and let Chloros calibrate at "
+            "import, or build a DeviceCalibration from a bundle file:\n"
+            "    from daq_cal import DeviceCalibration\n"
+            "    cal = DeviceCalibration.from_bundle(json.load(open(...)))")
 
     kind = {"u": "daq-u", "m": "daq-m", "e": "daq-e"}[args.device]
     sensor = build_sensor(args)
@@ -503,11 +527,66 @@ def main(argv=None):
     print(f"  serial (cal key): {serial_id}"
           + (f"   fw: {sensor.fw}" if sensor.fw else ""), flush=True)
 
+    # Offline calibration from the device's own flash. Reuses the already-open
+    # control socket so we don't take a second of the DAQ-E's 4 control slots.
+    cal = None
+    if args.calibrate != "off":
+        from daq_cal import DeviceCalibration
+        cal = DeviceCalibration.from_device(
+            args.host, control=sensor.t_control,
+            require_profiles=args.require_profiles)
+        print("Calibration (read from the device, no cloud):")
+        for line in cal.describe().splitlines():
+            print(f"  {line}")
+        if cal.profiles_source == "none" and not args.require_profiles:
+            print("  ! no cap/geometry profiles on this device -- output is "
+                  "bare-uncorrected.\n"
+                  "    If a cap IS fitted this is wrong (a sunshine cap is "
+                  "~30x). Connect the\n"
+                  "    unit to Chloros once to push profiles, or re-run with "
+                  "--require-profiles.",
+                  file=sys.stderr, flush=True)
+
     out = args.output or default_output(kind)
-    writer = DaqWriter(out, product_model=kind, product_serial=serial_id,
-                       device_name=args.device_name)
-    print(f"Recording RAW to: {os.path.abspath(out)}")
-    print("  (Chloros will fetch this sensor's calibration by serial at import)")
+    baking = (args.calibrate == "bake")
+    writer = DaqWriter(
+        out, product_model=kind, product_serial=serial_id,
+        device_name=args.device_name,
+        cap_id=(args.cap_id or (cal.cap_id if cal else "none")),
+        calibration_applied=baking,
+        calibration_bundle_sha=(cal.bundle_sha if baking else ""),
+        calibration_completed_utc=(cal.completed_utc if baking else ""),
+        cap_applied=(baking and cal is not None
+                     and cal.profiles_source != "none"))
+
+    csv_path = None
+    csv_fh = None
+    csv_out = None
+    if args.calibrate == "csv":
+        csv_path = args.csv or (os.path.splitext(out)[0] + ".csv")
+        csv_fh = open(csv_path, "w", newline="", encoding="utf-8")
+        csv_out = csv.writer(csv_fh)
+        # Header carries provenance so the file stands alone: anyone opening
+        # it later can tell which bundle and which cap produced the numbers.
+        csv_out.writerow([f"# MAPIR {kind} calibrated spectral irradiance "
+                          f"(W/m^2/nm)"])
+        csv_out.writerow([f"# sensor={serial_id} bundle_sha={cal.bundle_sha} "
+                          f"completed={cal.completed_utc} cap={cal.cap_id} "
+                          f"dark_model={cal.dark_model} "
+                          f"profiles={cal.profiles_source}"])
+        csv_out.writerow(["timestamp_ns", "integration_time_ms", "saturated"]
+                         + [f"{w:.1f}" for w in cal.wavelength_nm])
+
+    print(f"Recording {'CALIBRATED' if baking else 'RAW'} to: "
+          f"{os.path.abspath(out)}")
+    if csv_path:
+        print(f"  calibrated CSV: {os.path.abspath(csv_path)}")
+    if baking:
+        print("  (.daq carries calibrated W/m^2/nm; Chloros will import "
+              "as-is, not re-calibrate)")
+    else:
+        print("  (Chloros will fetch this sensor's calibration by serial "
+              "at import)")
     print("  Ctrl-C to stop.", flush=True)
 
     t0 = time.monotonic()
@@ -519,8 +598,21 @@ def main(argv=None):
             except TimeoutError as e:
                 print(f"  ! {e}", file=sys.stderr, flush=True)
                 continue
-            writer.write(spec, is_saturated=sat, integration_time_ms=inttime,
-                         timestamp_ns=time.time_ns())
+            ts = time.time_ns()
+            calibrated = None
+            if cal is not None:
+                # Pass this frame's own integration time: auto-exposure moves
+                # it between 1 and 500 ms and the dark model is a function of
+                # it. Using the requested value instead of the reported one
+                # would over-subtract at long integrations.
+                calibrated = cal.apply(spec, integration_time_ms=inttime,
+                                       cap_id=args.cap_id)
+            writer.write(calibrated if baking else spec,
+                         is_saturated=sat, integration_time_ms=inttime,
+                         timestamp_ns=ts)
+            if csv_out is not None:
+                csv_out.writerow([ts, inttime, int(bool(sat))]
+                                 + [f"{v:.6g}" for v in calibrated])
             n += 1
             if n % 10 == 0:
                 print(f"  {n} readings ...", flush=True)
@@ -530,8 +622,12 @@ def main(argv=None):
                 break
     finally:
         writer.close()
+        if csv_fh is not None:
+            csv_fh.close()
         sensor.standby_and_close()
         print(f"Stopped. Wrote {n} readings to {os.path.abspath(out)}")
+        if csv_path:
+            print(f"                    and {os.path.abspath(csv_path)}")
     return 0
 
 

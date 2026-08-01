@@ -292,10 +292,32 @@ class DaqWriter:
                           declaration stays truthful. The spectrum timestamps
                           themselves (``timestamp_ns``) are absolute epochs
                           and are NOT affected by this value.
+    calibration_applied : bool
+                          True when the spectra handed to :meth:`write` are
+                          already calibrated W/m^2/nm rather than raw counts.
+                          Chloros then imports them unchanged instead of
+                          applying a bundle. Requires
+                          ``calibration_bundle_sha``. Default False (raw),
+                          which is what you want unless the recording must be
+                          readable with no calibration source at all --
+                          raw files stay reprocessable against future bundle
+                          revisions, baked ones do not.
+    calibration_bundle_sha : str
+                          SHA-256 of the bundle that produced the calibrated
+                          values. Mandatory when ``calibration_applied``;
+                          it is the only record of which chain ran.
+    calibration_completed_utc : str
+                          The bundle's own ``completed_utc``, carried through
+                          for audit.
+    cap_applied : bool    True when a cap / geometry per-wavelength profile
+                          was folded into the written spectra. Only meaningful
+                          alongside ``calibration_applied``.
     """
 
     def __init__(self, path, *, product_model, product_serial,
-                 device_name="", cap_id="none", tz_offset_minutes=0):
+                 device_name="", cap_id="none", tz_offset_minutes=0,
+                 calibration_applied=False, calibration_bundle_sha="",
+                 calibration_completed_utc="", cap_applied=False):
         kind = str(product_model).strip().lower()
         if kind not in _VALID_KINDS:
             raise ValueError(
@@ -316,11 +338,25 @@ class DaqWriter:
         cur = self._conn.cursor()
         cur.execute(_ALS_META_DDL)
         cur.execute(_ALS_LOG_DDL)
-        # Raw recording: empty calibration sha -> calibration_applied = 0 so
-        # Chloros calibrates at import by serial. cap recorded but not applied.
+        # Raw recording (the default): empty calibration sha ->
+        # calibration_applied = 0 so Chloros calibrates at import by serial.
+        # cap recorded but not applied.
+        #
+        # When the caller has already applied a bundle -- record_daq's
+        # ``--calibrate bake``, which uses the bundle stored on the DAQ-E
+        # itself -- these flip to 1 and carry the bundle sha, so Chloros
+        # imports the spectra as-is instead of calibrating them a second
+        # time. Baked files are NOT reprocessable against a future bundle
+        # revision; prefer raw unless the recording has to stand alone.
+        #
         # v1.23: utc_offset_minutes declares the timezone of the capture
         # system's naive wall-clock stamps (0 = UTC, this project's
         # convention) so Chloros needs no manual timezone setting.
+        if calibration_applied and not str(calibration_bundle_sha).strip():
+            raise ValueError(
+                "calibration_applied=True requires calibration_bundle_sha -- "
+                "an applied calibration with no provenance cannot be audited "
+                "or reprocessed.")
         cur.execute(
             "INSERT INTO als_meta (version, product_model, product_serial, "
             "device_name, calibration_applied, calibration_bundle_sha, "
@@ -328,16 +364,22 @@ class DaqWriter:
             "utc_offset_minutes) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             ("1.23", kind, str(product_serial).strip(), str(device_name),
-             0, "", "", (cap_id or "none"), 0, int(tz_offset_minutes)))
+             int(bool(calibration_applied)),
+             str(calibration_bundle_sha or ""),
+             str(calibration_completed_utc or ""),
+             (cap_id or "none"), int(bool(cap_applied)),
+             int(tz_offset_minutes)))
         self._conn.commit()
         self._count = 0
 
     def write(self, spectrum, is_saturated, integration_time_ms,
               timestamp_ns=None):
-        """Append one raw spectrum reading.
+        """Append one spectrum reading.
 
         spectrum : sequence/np.ndarray of raw sensor counts (the sensor's
-                   firmware-output spectrum, BEFORE any calibration).
+                   firmware-output spectrum, BEFORE any calibration) -- or,
+                   when the writer was opened with ``calibration_applied``,
+                   calibrated spectral irradiance in W/m^2/nm.
         is_saturated : bool
         integration_time_ms : int  the integration time used for this frame
                    (Chloros needs it for the integration-aware dark model).

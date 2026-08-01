@@ -438,12 +438,131 @@ def test_camera_capture_flow():
         skip("capture TIFF EXIF checks", "pip install tifffile")
 
 
+def test_offline_calibration():
+    """daq_cal: the transform applied straight off the DAQ-E's onboard bundle.
+
+    Self-contained by design -- reference values are computed here from the
+    documented chain rather than by importing chloros, so this file keeps
+    working in a checkout that has no chloros beside it. The *cross-repo*
+    parity guard (bit equality against chloros's own DAQCalibration) lives in
+    mapirlab/tests/test_daq_scripts_offline_parity.py.
+    """
+    print("\n-- offline calibration (daq_cal) --")
+    import daq_cal
+
+    n = 8
+    wl = [400.0 + 10.0 * i for i in range(n)]
+    gain = [3.0e-5 * (1 + 0.1 * i) for i in range(n)]
+    raw = [100.0 * (i + 1) for i in range(n)]
+
+    def bundle(*, decomp=True, geom=False):
+        dark = {"daq_dark_mean_w_per_m2_per_nm": 20.0}
+        if decomp:
+            dark["daq_dark_rate_w_per_m2_per_nm"] = 3.0
+            dark["daq_dark_offset_per_ms_w_per_m2_per_nm"] = 17.0
+        return {"completed_utc": "2026-01-02T03:04:05+00:00",
+                "run": {"device_kind": "daq-e", "sensor_id": "AA-BB-CC-DD-EE"},
+                "stages": {
+                    "dark": dark,
+                    "wavelength_alignment": {"corrected_wavelength_grid_nm": wl},
+                    "radiometric": {"gain_per_wavelength": gain,
+                                    "irradiance_geometry_factor_applied": geom}}}
+
+    cal = daq_cal.DeviceCalibration.from_bundle(bundle())
+    check("dark model is the per-unit decomposition",
+          cal.dark_model == "rate_plus_offset_over_t", cal.dark_model)
+    # dark(t) = rate + offset/t
+    check("dark(1 ms) = rate + offset", abs(cal.effective_dark(1) - 20.0) < 1e-9)
+    check("dark(50 ms) = 3 + 17/50", abs(cal.effective_dark(50) - 3.34) < 1e-9)
+    check("dark(None) falls back to the fixed scalar",
+          abs(cal.effective_dark(None) - 20.0) < 1e-9)
+
+    # out = (raw - dark) * gain * pi, floored at zero.
+    want = np.maximum(
+        (np.asarray(raw, dtype=np.float32) - np.float32(3.34))
+        * np.asarray(gain, dtype=np.float32) * np.float32(math.pi), 0.0)
+    got = cal.apply(raw, integration_time_ms=50)
+    check("apply = (raw - dark(t)) * gain * pi",
+          np.allclose(got, want, rtol=1e-6), f"max diff {np.max(np.abs(got - want)):.3g}")
+
+    # A bundle with the geometry already folded in must NOT get pi again.
+    got_geom = daq_cal.DeviceCalibration.from_bundle(
+        bundle(geom=True)).apply(raw, integration_time_ms=50)
+    check("pi is not applied twice when baked into gain",
+          np.allclose(got_geom, want / math.pi, rtol=1e-6))
+
+    # Negative dark residue is clamped, never emitted.
+    dim = [1.0] * n
+    check("sub-dark readings clamp to zero, not negative",
+          np.all(cal.apply(dim, integration_time_ms=50) >= 0.0))
+
+    # Scalar-only bundle + fleet fraction pushed in the profiles document.
+    f = 0.9
+    prof = {"schema_version": 1, "device_kind": "e", "cap_id": "none",
+            "dark_fraction": {"offset_fraction": f}}
+    scal = daq_cal.DeviceCalibration.from_bundle(bundle(decomp=False))
+    scal_f = daq_cal.DeviceCalibration.from_bundle(bundle(decomp=False),
+                                                   profiles=prof)
+    check("scalar-only bundle alone -> fixed scalar",
+          scal.dark_model == "fixed_scalar", scal.dark_model)
+    check("scalar-only + pushed fleet fraction -> integration aware",
+          scal_f.dark_model == "fleet_fraction", scal_f.dark_model)
+    check("fleet fraction: dark(t) = mean * ((1-f) + f/t)",
+          abs(scal_f.effective_dark(50) - 20.0 * ((1 - f) + f / 50)) < 1e-9)
+    check("a per-unit decomposition outranks the fleet fraction",
+          daq_cal.DeviceCalibration.from_bundle(
+              bundle(decomp=True), profiles=prof).dark_model
+          == "rate_plus_offset_over_t")
+
+    # Cap profile multiplies in; as_recorded skips every per-lambda profile.
+    corr = [0.5] * n
+    prof_cap = {"schema_version": 1, "device_kind": "e",
+                "cap_id": "sunshine_cosine",
+                "cap_profile": {"cap_id": "sunshine_cosine",
+                                "wavelength_grid_nm": wl,
+                                "correction_mean": corr}}
+    capped = daq_cal.DeviceCalibration.from_bundle(bundle(), profiles=prof_cap)
+    check("cap correction is applied",
+          np.allclose(capped.apply(raw, integration_time_ms=50),
+                      want * 0.5, rtol=1e-6))
+    check("as_recorded skips the cap",
+          np.allclose(capped.apply(raw, integration_time_ms=50,
+                                   cap_id="as_recorded"), want, rtol=1e-6))
+    check("cap profile NaN bins pass through uncorrected", np.allclose(
+        daq_cal.DeviceCalibration.from_bundle(
+            bundle(),
+            profiles={"schema_version": 1, "cap_id": "c",
+                      "cap_profile": {"cap_id": "c", "wavelength_grid_nm": wl,
+                                      "correction_mean": [float("nan")] * n}}
+        ).apply(raw, integration_time_ms=50), want, rtol=1e-6))
+
+    # Failure modes that must be loud rather than silently wrong.
+    def raises(fn):
+        try:
+            fn()
+            return False
+        except daq_cal.CalibrationError:
+            return True
+
+    check("spectrum/gain length mismatch is rejected",
+          raises(lambda: cal.apply(raw[:3], integration_time_ms=50)))
+    check("a newer profiles schema is refused, not guessed at",
+          raises(lambda: daq_cal.DeviceCalibration.from_bundle(
+              bundle(), profiles={"schema_version":
+                                  daq_cal.PROFILES_SCHEMA_VERSION + 1})))
+    check("a bundle with no gain vector is rejected",
+          raises(lambda: daq_cal.DeviceCalibration.from_bundle({"stages": {}})))
+    check("no profiles -> reported as bare/uncorrected",
+          cal.profiles_source == "none" and cal.cap_id == "none")
+
+
 def main():
     test_metadata_contract()
     test_wire_codec()
     test_camera_config()
     test_cable_sync_ordering()
     test_camera_capture_flow()
+    test_offline_calibration()
     n = sum(RESULTS)
     print(f"\n==== {n}/{len(RESULTS)} checks passed ====")
     if SKIPPED:
