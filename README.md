@@ -20,6 +20,7 @@ coding) for DIY drone and research setups.
 |------|---------|
 | `capture_lattice.py` | Control + raw capture from **LATTICE cameras** (M3C/M3M), with hardware-cable multi-camera sync |
 | `record_daq.py` | Record raw spectra from a **DAQ-U / DAQ-M / DAQ-E** to a Chloros-compatible `.daq` |
+| `daq_cal.py` | Apply a **DAQ-E**'s onboard factory calibration offline — no cloud, no Chloros |
 | `mapir_metadata.py` | The Chloros ingest contract: writes raw LATTICE TIFFs + the `.daq` SQLite format |
 | `selftest.py` | Self-contained checks that the output matches what Chloros reads on import |
 | `requirements.txt` | Dependencies |
@@ -141,6 +142,58 @@ Common options:
 Press **Ctrl-C** to stop. The script records continuously; mount the sensor
 upward-facing (downwelling) and run it for the whole flight.
 
+## Calibrated output with no cloud and no Chloros — DAQ-E only
+
+A DAQ-E carries its own factory calibration bundle in flash. `--calibrate`
+pulls it down over ethernet and applies it locally, so you get spectral
+irradiance in **W/m²/nm** without an account, an internet connection, or a
+Chloros install.
+
+```bash
+# .daq stays RAW; calibrated irradiance goes to a sibling .csv
+python record_daq.py e --host 192.168.1.50 --calibrate csv
+
+# just look at what the device is carrying (records nothing)
+python daq_cal.py 192.168.1.50
+```
+
+| `--calibrate` | `.daq` contents | When to use |
+|---------------|-----------------|-------------|
+| `off` (default) | raw counts | Chloros will calibrate at import |
+| `csv` | raw counts, **plus** a calibrated `.csv` | **Recommended.** Usable numbers now, and the `.daq` stays reprocessable |
+| `bake` | calibrated W/m²/nm, stamped with the bundle SHA | the recording must stand completely alone |
+
+Prefer `csv` over `bake`. A raw `.daq` can be re-calibrated later if a
+coefficient revision lands; a baked one is frozen at whatever the bundle said
+the day you recorded.
+
+**If a cap is fitted, the device needs its profiles.** Cosine correctors and
+FOV cones have their own per-wavelength correction, and the bare diffuser has a
+geometry correction of its own. Those live in Chloros, not in the bundle, so a
+DAQ-E that has never been connected to Chloros produces **bare-uncorrected**
+output — off by roughly 2× bare, or ~11× with a sunshine cap. Connect the unit
+to Chloros once (it pushes the profiles onto the device and they stay there),
+or pass `--require-profiles` to make the script refuse rather than log a
+plausible wrong number.
+
+```bash
+python record_daq.py e --host 192.168.1.50 --calibrate csv --require-profiles
+```
+
+Use `daq_cal.py <host>` to print exactly which correction chain a unit will
+run — dark model, whether π is applied at runtime or baked into the gain, and
+which cap profile (if any) is aboard. Programmatically:
+
+```python
+from daq_cal import DeviceCalibration
+cal = DeviceCalibration.from_device("192.168.1.50")
+print(cal.describe())
+watts = cal.apply(raw_counts, integration_time_ms=50)
+```
+
+Always pass this frame's own `integration_time_ms` — auto-exposure moves it
+between 1 and 500 ms and the dark model is a function of it.
+
 ## How Chloros uses your files
 
 - **Serial number is the key.** Each `.daq` (and each LATTICE TIFF) carries the
@@ -161,6 +214,9 @@ upward-facing (downwelling) and run it for the whole flight.
   `mapir_metadata.py`).
 - **Raw means raw.** Spectra are the sensor's raw firmware output (no
   calibration); `calibration_applied = 0` tells Chloros to calibrate on import.
+  The one exception is `--calibrate bake`, which sets `calibration_applied = 1`
+  and carries the bundle SHA — Chloros then imports those spectra as-is instead
+  of calibrating them a second time.
 
 ## Notes
 
