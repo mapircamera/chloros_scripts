@@ -499,8 +499,15 @@ def main(argv=None):
                    help="explicit path for --calibrate csv output "
                         "(default: the .daq path with a .csv suffix)")
     p.add_argument("--cap-id",
-                   help="override the cap profile id the device reports "
-                        "(e.g. sunshine_cosine, fov_45, none, as_recorded)")
+                   help="override the cap profile the device reports. The "
+                        "device carries ONE resolved profile, so the only "
+                        "accepted values are 'as_recorded' (skip all "
+                        "per-wavelength profiles) or the cap it already "
+                        "carries. Naming a different cap is refused -- there "
+                        "is no local copy of its correction curve, and "
+                        "applying the stored one under another name is ~11x "
+                        "off between sunshine and bare. To change caps, "
+                        "re-push profiles from Chloros.")
     p.add_argument("--require-profiles", action="store_true",
                    help="with --calibrate, fail unless the device carries cap/"
                         "geometry profiles. Use when a cap IS fitted: without "
@@ -538,6 +545,18 @@ def main(argv=None):
         print("Calibration (read from the device, no cloud):")
         for line in cal.describe().splitlines():
             print(f"  {line}")
+        if args.cap_id:
+            # Validate the override now rather than on the first frame: the
+            # device carries one resolved profile, and naming a different cap
+            # is refused (there is no local copy of its curve). Failing here
+            # costs nothing; failing mid-recording loses the run.
+            import numpy as _np
+            try:
+                cal.apply(_np.zeros(cal.n_points, dtype=_np.float32),
+                          integration_time_ms=args.integration_time,
+                          cap_id=args.cap_id)
+            except Exception as e:
+                raise SystemExit(f"--cap-id {args.cap_id}: {e}")
         if cal.profiles_source == "none" and not args.require_profiles:
             print("  ! no cap/geometry profiles on this device -- output is "
                   "bare-uncorrected.\n"
