@@ -20,6 +20,7 @@ coding) for DIY drone and research setups.
 |------|---------|
 | `capture_lattice.py` | Control + raw capture from **LATTICE cameras** (M3C/M3M), with hardware-cable multi-camera sync |
 | `record_daq.py` | Record raw spectra from a **DAQ-U / DAQ-M / DAQ-E** to a Chloros-compatible `.daq` |
+| `daq_stream.py` | Listen to **any number** of DAQ-E / DAQ-E-S sensors over multicast (raw or calibrated) |
 | `daq_cal.py` | Apply a **DAQ-E**'s onboard factory calibration offline — no cloud, no Chloros |
 | `mapir_metadata.py` | The Chloros ingest contract: writes raw LATTICE TIFFs + the `.daq` SQLite format |
 | `selftest.py` | Self-contained checks that the output matches what Chloros reads on import |
@@ -144,26 +145,59 @@ upward-facing (downwelling) and run it for the whole flight.
 
 ## DAQ-E data channels — what exists, and what these scripts use
 
-The DAQ-E emits **one** spectral data stream, and it is **raw** — the sensor's
-firmware-output counts, byte for byte. There is no calibrated stream on the
-wire. Calibration is always applied by whoever consumes the data.
+A DAQ-E on firmware **1.7.0+** emits two spectral streams on separate multicast
+groups: **raw** counts (always) and **calibrated** W/m²/nm (once the device
+carries coefficients — a DAQ-E-S always does). Older firmware emits raw only.
+
+Raw is always the reprocessable one: it is the sensor's firmware output byte
+for byte, so a recording made from it can be re-calibrated later against a
+revised bundle. Prefer it for anything you intend to keep.
 
 | Channel | Wire | Content | These scripts |
 |---------|------|---------|---------------|
-| Raw, unicast | TCP `5000` | raw counts, one client at a time | ✅ `record_daq.py` |
-| Raw, multicast | UDP `239.10.10.10:5002` | same raw counts, any number of listeners | ❌ not supported here — see `client/daq_e_client.py` in the [ESP32 repo](https://github.com/mapircamera/ESP32) |
-| Control | TCP `5001` | JSON: config, status, bundle/profile/cert read+write | ✅ `daq_cal.py` |
+| Raw, unicast | TCP `5000` | raw counts, **one client at a time** | ✅ `record_daq.py` |
+| Raw, multicast | UDP `239.10.10.10:5002` | raw counts, any number of listeners | ✅ `daq_stream.py` |
+| Calibrated, multicast | UDP `239.10.10.11:5003` | W/m²/nm, when the device carries coefficients | ✅ `daq_stream.py --calibrated` |
+| Control | TCP `5001` | JSON: config, status, bundle/profile/cert | ✅ `daq_cal.py` |
 
-`record_daq.py` uses the **TCP raw** channel, which is exclusive: one consumer
-at a time. If you need several consumers on the same sensor simultaneously —
-or sub-millisecond alignment with LATTICE cameras — that's the multicast
-channel, which carries PTP-disciplined per-frame timestamps. The full datagram
-layout is in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
+Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
 
-**"Calibrated stream" means applying the bundle locally**, which is what
-`--calibrate` below does — it reads the calibration off the device and applies
-it to the raw frames in Python. The numbers are identical to what Chloros
-produces; the arithmetic just runs on your machine instead.
+## Many sensors at once — `daq_stream.py`
+
+```bash
+python daq_stream.py                         # every sensor on the network
+python daq_stream.py --calibrated            # W/m²/nm straight off the device
+python daq_stream.py --serial 11-22-33-44-55 --csv out.csv
+```
+
+Multicast, so any number of consumers can read the same sensor and any number
+of sensors can share a group. The TCP raw channel `record_daq.py` uses is
+exclusive — one client — so this is the path for multi-sensor work and for
+running alongside Chloros.
+
+**Sensor separation.** Datagram v2 (firmware 1.7.0+) carries the sender's MAC,
+serial, model and per-frame integration time, so frames are self-describing and
+the script demultiplexes on identity.
+
+Older firmware emits v1, which carries none of that: two v1 units on one group
+are separable only by UDP source address, and a receiver that doesn't filter
+reads a **~50/50 blend of both while looking perfectly healthy**. That is not
+hypothetical — it happened on hardware on 2026-07-14. `daq_stream.py` keys v1
+frames on source IP and prints a warning, but the real fix is updating the
+firmware.
+
+**Timestamps.** `timestamp_us` is latched on the ESP32 as the sensor's last
+byte arrives, so it excludes network and OS jitter. When a frame reports PTP
+sync, clocks across sensors are disciplined to a common grandmaster (~50 µs on
+this hardware) and frames from different units are directly comparable — that's
+what makes multi-sensor and sensor-to-LATTICE alignment meaningful.
+
+**Two meanings of "calibrated".** The `--calibrated` stream above is computed
+*by the device*. `--calibrate` in `record_daq.py` (below) applies the bundle
+*locally in Python*. Both produce the same numbers — the device runs a
+pre-folded version of the same arithmetic — so use whichever fits: the stream
+needs no calibration machinery on your side, the local path works on any
+firmware.
 
 ## Calibrated output with no cloud and no Chloros — DAQ-E only
 
