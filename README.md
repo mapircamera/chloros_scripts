@@ -145,9 +145,13 @@ upward-facing (downwelling) and run it for the whole flight.
 
 ## DAQ-E data channels — what exists, and what these scripts use
 
-The DAQ-E emits **one** spectral data stream, and it is **raw** — the sensor's
-firmware-output counts, byte for byte. There is no calibrated stream on the
-wire. Calibration is always applied by whoever consumes the data.
+A DAQ-E on firmware **1.7.0+** emits two spectral streams on separate multicast
+groups: **raw** counts (always) and **calibrated** W/m²/nm (once the device
+carries coefficients — a DAQ-E-S always does). Older firmware emits raw only.
+
+Raw is always the reprocessable one: it is the sensor's firmware output byte
+for byte, so a recording made from it can be re-calibrated later against a
+revised bundle. Prefer it for anything you intend to keep.
 
 | Channel | Wire | Content | These scripts |
 |---------|------|---------|---------------|
