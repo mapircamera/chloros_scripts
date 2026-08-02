@@ -142,6 +142,29 @@ Common options:
 Press **Ctrl-C** to stop. The script records continuously; mount the sensor
 upward-facing (downwelling) and run it for the whole flight.
 
+## DAQ-E data channels — what exists, and what these scripts use
+
+The DAQ-E emits **one** spectral data stream, and it is **raw** — the sensor's
+firmware-output counts, byte for byte. There is no calibrated stream on the
+wire. Calibration is always applied by whoever consumes the data.
+
+| Channel | Wire | Content | These scripts |
+|---------|------|---------|---------------|
+| Raw, unicast | TCP `5000` | raw counts, one client at a time | ✅ `record_daq.py` |
+| Raw, multicast | UDP `239.10.10.10:5002` | same raw counts, any number of listeners | ❌ not supported here — see `client/daq_e_client.py` in the [ESP32 repo](https://github.com/mapircamera/ESP32) |
+| Control | TCP `5001` | JSON: config, status, bundle/profile/cert read+write | ✅ `daq_cal.py` |
+
+`record_daq.py` uses the **TCP raw** channel, which is exclusive: one consumer
+at a time. If you need several consumers on the same sensor simultaneously —
+or sub-millisecond alignment with LATTICE cameras — that's the multicast
+channel, which carries PTP-disciplined per-frame timestamps. The full datagram
+layout is in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
+
+**"Calibrated stream" means applying the bundle locally**, which is what
+`--calibrate` below does — it reads the calibration off the device and applies
+it to the raw frames in Python. The numbers are identical to what Chloros
+produces; the arithmetic just runs on your machine instead.
+
 ## Calibrated output with no cloud and no Chloros — DAQ-E only
 
 A DAQ-E carries its own factory calibration bundle in flash. `--calibrate`
@@ -167,18 +190,39 @@ Prefer `csv` over `bake`. A raw `.daq` can be re-calibrated later if a
 coefficient revision lands; a baked one is frozen at whatever the bundle said
 the day you recorded.
 
-**If a cap is fitted, the device needs its profiles.** Cosine correctors and
-FOV cones have their own per-wavelength correction, and the bare diffuser has a
-geometry correction of its own. Those live in Chloros, not in the bundle, so a
-DAQ-E that has never been connected to Chloros produces **bare-uncorrected**
-output — off by roughly 2× bare, or ~11× with a sunshine cap. Connect the unit
-to Chloros once (it pushes the profiles onto the device and they stay there),
-or pass `--require-profiles` to make the script refuse rather than log a
-plausible wrong number.
+### Caps
+
+A cosine corrector or FOV cone has its own per-wavelength correction, and even
+a **bare** DAQ-E has a geometry correction (the bare diffuser over-reads
+directional light ~2×, while a sunshine cap is near-ideal). None of that is in
+the calibration bundle — it lives in Chloros and is versioned separately.
+
+So the cap is **not a device setting you can change from these scripts.** It is
+resolved by Chloros for the unit and pushed into the device's profile store,
+where `daq_cal.py` reads it. `daq_cal.py <host>` prints which cap is aboard.
+
+| Situation | Result |
+|-----------|--------|
+| Device carries the right profile | correct output, matches Chloros exactly |
+| Device carries **no** profile | **bare-uncorrected** — ~2× off bare, ~11× off under a sunshine cap |
+| Physical cap changed | re-push from Chloros; the scripts cannot substitute another cap's curve |
+
+`--cap-id` is an override, not a cap selector. The device carries exactly one
+resolved profile, so the only accepted values are `as_recorded` (skip every
+per-wavelength profile) or the cap the device already carries. Naming a
+different cap is **refused** — there is no local copy of its correction curve,
+and applying the stored one under another name would be silently wrong by the
+sunshine-vs-bare factor. Validated at startup, not mid-recording.
+
+Use `--require-profiles` to refuse outright rather than log a plausible wrong
+number when a cap is fitted but no profile is aboard:
 
 ```bash
 python record_daq.py e --host 192.168.1.50 --calibrate csv --require-profiles
 ```
+
+None of this applies to a future **DAQ-E-S**, where the sunshine cap is
+permanent and calibrated in, so the correction lives in the gain itself.
 
 Use `daq_cal.py <host>` to print exactly which correction chain a unit will
 run — dark model, whether π is applied at runtime or baked into the gain, and

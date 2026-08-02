@@ -528,6 +528,25 @@ def test_offline_calibration():
     check("as_recorded skips the cap",
           np.allclose(capped.apply(raw, integration_time_ms=50,
                                    cap_id="as_recorded"), want, rtol=1e-6))
+    # The device carries ONE resolved profile. An override naming a different
+    # cap can't be honoured -- there is no local copy of that cap's curve --
+    # and applying the stored curve under another name is a ~11x error between
+    # sunshine and bare. Refuse instead.
+    def _cap_refused(cid):
+        try:
+            capped.apply(raw, integration_time_ms=50, cap_id=cid)
+            return False
+        except daq_cal.CalibrationError:
+            return True
+
+    check("cap_id naming a different cap is refused, not mis-applied",
+          _cap_refused("fov_45"))
+    check("cap_id='none' on a capped device is refused (would be ~11x off)",
+          _cap_refused("none"))
+    check("cap_id matching the stored profile is a no-op override",
+          np.allclose(capped.apply(raw, integration_time_ms=50,
+                                   cap_id="sunshine_cosine"),
+                      want * 0.5, rtol=1e-6))
     check("cap profile NaN bins pass through uncorrected", np.allclose(
         daq_cal.DeviceCalibration.from_bundle(
             bundle(),

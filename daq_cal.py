@@ -370,8 +370,18 @@ class DeviceCalibration:
         fixed-scalar dark, which over-subtracts at long integrations, biases
         the result low, and clips near-floor bands to zero.
 
-        ``cap_id`` overrides the profile selection for this call:
-        ``"as_recorded"`` skips every per-wavelength profile (pi only).
+        ``cap_id`` overrides the profile selection for this call. The device
+        carries exactly ONE resolved profile -- the cap chloros was told this
+        unit has -- so the only overrides that can be honoured are:
+
+        * ``"as_recorded"`` -- skip every per-wavelength profile (pi only).
+        * the cap the device actually carries (i.e. a no-op override).
+
+        Naming any OTHER cap raises, rather than applying the stored curve
+        under a different name. There is no local copy of another cap's
+        correction to substitute, and silently applying the wrong one is a
+        ~11x error between a sunshine cap and bare. If the physical cap
+        changed, re-push profiles from chloros.
         """
         arr = np.asarray(raw_spectrum, dtype=np.float32)
         if arr.shape != self._gain.shape:
@@ -390,7 +400,25 @@ class DeviceCalibration:
         if effective_cap == CAP_ID_AS_RECORDED:
             return out
         if self._cap_profile.is_noop:
+            # Nothing aboard to apply. An override naming a real cap can't be
+            # satisfied either, and quietly returning bare-uncorrected values
+            # for a capped sensor is the ~11x failure this guard exists for.
+            if effective_cap not in (CAP_ID_NONE, self._cap_id):
+                raise CalibrationError(
+                    f"cap_id={effective_cap!r} requested, but this device "
+                    f"carries no cap profile at all. Push profiles from "
+                    f"chloros for the fitted cap, or use "
+                    f"cap_id='as_recorded'.")
             return out
+        if effective_cap != self._cap_profile.cap_id:
+            raise CalibrationError(
+                f"cap_id={effective_cap!r} requested, but this device carries "
+                f"the {self._cap_profile.cap_id!r} profile and there is no "
+                f"local copy of any other cap's correction curve. Applying "
+                f"the stored curve under a different name would be silently "
+                f"wrong (sunshine vs bare is ~11x). Re-push profiles from "
+                f"chloros for the cap actually fitted, or use "
+                f"cap_id='as_recorded' to skip all per-wavelength profiles.")
         corr = self._cap_profile.correction
         if corr.shape != self._gain.shape:
             raise CalibrationError(
