@@ -575,6 +575,89 @@ def test_offline_calibration():
           cal.profiles_source == "none" and cal.cap_id == "none")
 
 
+def test_multicast_stream():
+    """daq_stream: v1/v2 datagram decode and multi-sensor separation.
+
+    The reason v2 exists is that v1 carried no sensor identity, so two units
+    on one group were separable only by UDP source address -- and a receiver
+    that didn't filter read a ~50/50 blend of both while looking healthy
+    (hardware, 2026-07-14).
+    """
+    print("\n-- multicast stream (daq_stream) --")
+    import daq_stream as ds
+
+    def frame(ver=2, *, mac=b"\xaa\xbb\xcc\xdd\xee\xff",
+              serial=b"\x11\x22\x33\x44\x55", cal=False, seq=3, n=4,
+              integ=50, model=0, corrupt=False):
+        if cal:
+            payload = struct.pack("<%df" % n, *[1.5] * n)
+            flags = 0x02 | 0x08
+        else:
+            payload = (b"\x03\xbb\x28\x00" + struct.pack("<H", integ)
+                       + b"\x00\x00" + struct.pack("<I", n)
+                       + struct.pack("<%df" % n, *[100.0] * n))
+            flags = 0x02
+        if ver == 1:
+            d = bytearray(18)
+            d[0:2] = b"\xda\x0e"; d[2] = 1; d[3] = flags
+            struct.pack_into("<I", d, 4, seq); struct.pack_into("<Q", d, 8, 7)
+            struct.pack_into("<H", d, 16, len(payload))
+        else:
+            d = bytearray(32)
+            d[0:2] = b"\xda\x0e"; d[2] = 2; d[3] = flags
+            struct.pack_into("<I", d, 4, seq); struct.pack_into("<Q", d, 8, 7)
+            d[16:22] = mac; d[22:27] = serial; d[27] = model
+            struct.pack_into("<H", d, 28, integ)
+            struct.pack_into("<H", d, 30, len(payload))
+        d += payload
+        crc = ds._crc16_ccitt(bytes(d)) ^ (0xFFFF if corrupt else 0)
+        d += struct.pack("<H", crc)
+        return bytes(d)
+
+    f = ds.parse_datagram(frame(2), "10.0.0.5")
+    check("v2 carries the sensor serial", f["sensor_serial"] == "11-22-33-44-55")
+    check("v2 carries the model", f["model"] == "daq-e")
+    check("v2 carries this frame's integration time",
+          f["integration_time_ms"] == 50)
+    check("v2 keys on serial, not source IP", f["device_key"] == "11-22-33-44-55")
+    check("raw spectrum decoded", f["spectrum"] == [100.0] * 4)
+    check("model byte 1 = daq-e-s",
+          ds.parse_datagram(frame(2, model=1), "x")["model"] == "daq-e-s")
+
+    c = ds.parse_datagram(frame(2, cal=True), "x")
+    check("calibrated flag set", c["calibrated"])
+    check("calibrated payload is float32 irradiance",
+          c["spectrum"] == [1.5] * 4)
+
+    v1 = ds.parse_datagram(frame(1), "10.0.0.5")
+    check("v1 still decodes (legacy units keep working)", v1["version"] == 1)
+    check("v1 has no identity, falls back to source IP",
+          v1["sensor_serial"] is None and v1["device_key"] == "10.0.0.5")
+
+    check("corrupt CRC rejected",
+          ds.parse_datagram(frame(2, corrupt=True), "x") is None)
+    check("bad magic rejected",
+          ds.parse_datagram(b"\x00\x00" + frame(2)[2:], "x") is None)
+    check("unknown version rejected",
+          ds.parse_datagram(frame(2)[:2] + b"\x09" + frame(2)[3:], "x") is None)
+    truncated = frame(2)[:-1]
+    check("truncated datagram rejected",
+          ds.parse_datagram(truncated, "x") is None)
+
+    # The 2026-07-14 failure, as a test: two units, one group, no blending.
+    a_ser, b_ser = b"\x11\x22\x33\x44\x55", b"\x66\x77\x88\x99\xaa"
+    seen = {}
+    for i in range(6):
+        for ser, integ in ((a_ser, 50), (b_ser, 200)):
+            fr = ds.parse_datagram(
+                frame(2, serial=ser, seq=i, integ=integ), "10.0.0.9")
+            seen.setdefault(fr["device_key"], []).append(
+                fr["integration_time_ms"])
+    check("two sensors on one group separate cleanly", len(seen) == 2)
+    check("no interleaving between sensors",
+          all(len(set(v)) == 1 for v in seen.values()))
+
+
 def main():
     test_metadata_contract()
     test_wire_codec()
@@ -582,6 +665,7 @@ def main():
     test_cable_sync_ordering()
     test_camera_capture_flow()
     test_offline_calibration()
+    test_multicast_stream()
     n = sum(RESULTS)
     print(f"\n==== {n}/{len(RESULTS)} checks passed ====")
     if SKIPPED:
