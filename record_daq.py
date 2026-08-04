@@ -450,7 +450,8 @@ def build_sensor(args):
     sensor = DaqSensor(kind, transport, integration_ms=args.integration_time,
                        frame_avg=args.frame_avg, enable_ae=not args.no_ae)
     if kind == "daq-e":
-        sensor.t_control = DaqEControl(args.host, port=args.control_port)
+        sensor.t_control = DaqEControl(args.host, port=args.control_port,
+                                       token=args.token or "")
     return sensor
 
 
@@ -474,6 +475,13 @@ def main(argv=None):
     p.add_argument("--host", help="DAQ-E IP address")
     p.add_argument("--control-port", type=int, default=5001,
                    help="DAQ-E JSON control TCP port (default 5001)")
+    p.add_argument("--token", default="",
+                   help="DAQ-E control-channel auth token. A unit with one "
+                        "provisioned (done at the calibration station) "
+                        "refuses every command except hello without it -- "
+                        "the symptom is auth_failed on connect or on "
+                        "--calibrate's get_calibration. Harmless to omit on "
+                        "unprovisioned units.")
     p.add_argument("--raw-port", type=int, default=5000,
                    help="DAQ-E raw spectral TCP port (default 5000)")
     p.add_argument("--integration-time", type=int, default=32,
