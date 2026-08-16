@@ -102,10 +102,17 @@ class LatticeCamera:
         node.value = node.max
 
     # -- identity --
-    def identify(self):
+    def identify(self, model_fallback=None):
         """Read serial (cal key) + model from the camera. The MAPIR model
         string lives in DeviceUserID (e.g. 'M3C-L41-FRGN'); we prefix 'LATT-'
-        for the EXIF Model tag Chloros keys on."""
+        for the EXIF Model tag Chloros keys on.
+
+        ``model_fallback`` (the --model flag) is used ONLY when the camera's
+        own DeviceUserID is empty -- a factory-reset unit. It is deliberately
+        not an override: in a mixed array the cameras that still know their
+        own model must keep reporting it, or the wrong calibration gets
+        stamped on frames that were perfectly self-describing.
+        """
         self.serial = str(self._get("DeviceSerialNumber")).strip()
         uid = ""
         try:
@@ -113,9 +120,14 @@ class LatticeCamera:
         except Exception:
             pass
         if not uid:
-            raise RuntimeError(
-                f"camera {self.serial}: DeviceUserID is empty (was it factory "
-                f"reset?). Pass the model with --model LATT-M3C-L41-FRGN.")
+            uid = str(model_fallback or "").strip()
+            if not uid:
+                raise RuntimeError(
+                    f"camera {self.serial}: DeviceUserID is empty (was it "
+                    f"factory reset?). Pass the model with "
+                    f"--model LATT-M3C-L41-FRGN.")
+            print(f"  [{self.serial}] DeviceUserID empty; using --model "
+                  f"{uid}", flush=True)
         self.model = uid if uid.upper().startswith("LATT-") else "LATT-" + uid
         self.is_mono = "M3M" in self.model.upper()
         return self.serial, self.model
@@ -246,7 +258,7 @@ def _load_system():
             "wrapper, then retry. See README.") from e
 
 
-def open_cameras(system, wanted_serials=None):
+def open_cameras(system, wanted_serials=None, model_fallback=None):
     infos = system.device_infos
     if not infos:
         raise SystemExit("No cameras found. Check power, cabling, and that the "
@@ -255,7 +267,7 @@ def open_cameras(system, wanted_serials=None):
     cams = []
     for dev in devices:
         cam = LatticeCamera(dev)
-        cam.identify()
+        cam.identify(model_fallback)
         cams.append(cam)
     if wanted_serials:
         wanted = set(wanted_serials)
@@ -356,6 +368,12 @@ def main(argv=None):
     p.add_argument("--master", help="serial of the master camera (cable sync)")
     p.add_argument("--serials", help="comma-separated serials to use "
                                      "(default: all connected)")
+    p.add_argument("--model",
+                   help="model string to fall back to for a camera whose "
+                        "DeviceUserID is empty (e.g. LATT-M3C-L41-FRGN, after "
+                        "a factory reset). Cameras that report their own model "
+                        "keep it -- this is a fallback, not an override, so a "
+                        "mixed array cannot be mislabelled.")
     p.add_argument("--exposure-us", type=float,
                    help="fixed exposure in microseconds (default: auto-exposure)")
     p.add_argument("--frames", type=int, default=0,
@@ -374,7 +392,7 @@ def main(argv=None):
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     wanted = [s.strip() for s in args.serials.split(",")] if args.serials else None
-    cams = open_cameras(system, wanted)
+    cams = open_cameras(system, wanted, args.model)
     print(f"Found {len(cams)} LATTICE camera(s):")
     for c in cams:
         print(f"  {c.serial}  {c.model}  ({'mono' if c.is_mono else 'color'})")

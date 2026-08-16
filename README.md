@@ -102,6 +102,7 @@ python capture_lattice.py --exposure-us 5000
 | `--sync cable\|software` | `cable` = hardware M8 sync; `software` = single-cam / no-cable | `cable` |
 | `--master SERIAL` | master camera for cable sync | lowest serial |
 | `--serials A,B,…` | use only these cameras | all connected |
+| `--model STR` | model to fall back to when a camera's `DeviceUserID` is empty (factory reset) | read from the camera |
 | `--exposure-us N` | fixed exposure (µs) | auto-exposure |
 | `--frames N` / `--duration S` / `--interval S` | stop after N shots / S seconds / wait S between shots | until Ctrl-C |
 | `--output-dir DIR` | where to write TIFFs | `.` |

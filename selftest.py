@@ -374,6 +374,34 @@ def test_camera_config():
     check("PixelFormat Mono12 (mono)", w2.get("PixelFormat") == "Mono12")
     check("fixed exposure: ExposureAuto Off + ExposureTime", w2.get("ExposureAuto") == "Off" and w2.get("ExposureTime") == 5000.0)
 
+    # --model: fallback for a factory-reset camera (empty DeviceUserID), and
+    # NOT an override for one that still knows its own model.
+    blank = _FakeNodemap({"DeviceSerialNumber": "77", "DeviceUserID": ""},
+                         {"Width": 8, "Height": 8})
+    cam3 = C.LatticeCamera(_FakeDevice(blank, np.zeros((4, 4), np.uint16)))
+    try:
+        cam3.identify()
+        check("empty DeviceUserID with no --model raises", False)
+    except RuntimeError as e:
+        check("empty DeviceUserID with no --model raises", "--model" in str(e))
+
+    cam3 = C.LatticeCamera(_FakeDevice(blank, np.zeros((4, 4), np.uint16)))
+    _, m3 = cam3.identify("LATT-M3M-L41-F850")
+    check("--model fills in an empty DeviceUserID",
+          m3 == "LATT-M3M-L41-F850", m3)
+    check("--model fallback still sets mono", cam3.is_mono is True)
+
+    cam3b = C.LatticeCamera(_FakeDevice(blank, np.zeros((4, 4), np.uint16)))
+    check("--model without the LATT- prefix is prefixed",
+          cam3b.identify("M3C-L41-FRGN")[1] == "LATT-M3C-L41-FRGN")
+
+    known = _FakeNodemap({"DeviceSerialNumber": "78",
+                          "DeviceUserID": "M3C-L41-FRGN"},
+                         {"Width": 8, "Height": 8})
+    cam4 = C.LatticeCamera(_FakeDevice(known, np.zeros((4, 4), np.uint16)))
+    check("--model does NOT override a camera that reports its own model",
+          cam4.identify("LATT-M3M-L41-F850")[1] == "LATT-M3C-L41-FRGN")
+
 
 def test_cable_sync_ordering():
     print("== cable sync wiring + firmware-quirk ordering ==")
