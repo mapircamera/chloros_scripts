@@ -8,6 +8,7 @@ env/
 
 # Captured/test output
 out/
+_selftest_out/
 *.tiff
 *.tif
 *.daq

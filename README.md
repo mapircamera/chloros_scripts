@@ -238,9 +238,36 @@ revised bundle. Prefer it for anything you intend to keep.
 | Raw, unicast | TCP `5000` | raw counts, **one client at a time** | ✅ `record_daq.py` |
 | Raw, multicast | UDP `239.10.10.10:5002` | raw counts, any number of listeners | ✅ `daq_stream.py` |
 | Calibrated, multicast | UDP `239.10.10.11:5003` | W/m²/nm, when the device carries coefficients | ✅ `daq_stream.py --calibrated` |
+| IMU, multicast | UDP `239.10.10.12:5004` | attitude at its own rate, independent of spectra (fw 1.8.0+) | ➖ not read by these scripts |
 | Control | TCP `5001` | JSON: config, status, bundle/profile/cert | ✅ `daq_cal.py` |
 
 Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
+
+**The IMU trailer.** On firmware **1.8.0+** — which is every DAQ-E-S — a
+spectral frame can carry a 22-byte attitude trailer appended *after* the CRC,
+announced by flags bit 4. It sits outside the CRC deliberately, so a corrupt
+trailer can never cost you a good spectrum; the corollary is that **a reader
+must tolerate the extra bytes**. A reader that checks for an exact datagram
+length instead rejects every frame such a unit sends, counts them as malformed,
+and shows the sensor as absent while it streams perfectly. `daq_stream.py`
+accepts them and reports the trailer's presence in the `imu` CSV column; it
+does not decode the attitude itself — that layout lives in
+[`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md),
+and Chloros decodes it.
+
+**Chloros reads the raw stream, not the calibrated one.** It subscribes only to
+`239.10.10.10:5002` and applies the bundle *host-side*, from its own cloud
+cache — and it drops a calibrated frame arriving on the raw group as a firmware
+bug rather than feeding W/m²/nm into a path expecting counts. Two consequences
+worth knowing:
+
+- The **calibrated stream is for third-party consumers** — anything that can't
+  carry the calibration machinery, which is what `daq_stream.py --calibrated`
+  is for. It is not the path Chloros processes, so a difference between it and
+  a Chloros product is a stale on-device profile, not a Chloros bug.
+- Chloros always re-derives from raw, which is why raw is **the reprocessable
+  one**: a coefficient revision reaches every raw recording you kept, and none
+  of the device-calibrated ones.
 
 ## Many sensors at once — `daq_stream.py`
 
@@ -272,12 +299,26 @@ sync, clocks across sensors are disciplined to a common grandmaster (~50 µs on
 this hardware) and frames from different units are directly comparable — that's
 what makes multi-sensor and sensor-to-LATTICE alignment meaningful.
 
+**Every frame says which stream it came from.** Raw counts and calibrated
+W/m²/nm differ by roughly four orders of magnitude, and nothing about the
+numbers themselves announces which you are holding. So the CSV carries a
+`calibrated` column, a `units` column and an `imu` column per row — taken from the **frame's own
+flag bit**, not from the group the script joined — plus a `#` provenance line
+naming the group and units at the top. If a frame's flag ever contradicts its
+group (a firmware bug: the two groups are meant to be exclusive), the script
+warns on stderr and records what actually arrived.
+
 **Two meanings of "calibrated".** The `--calibrated` stream above is computed
 *by the device*. `--calibrate` in `record_daq.py` (below) applies the bundle
-*locally in Python*. Both produce the same numbers — the device runs a
-pre-folded version of the same arithmetic — so use whichever fits: the stream
-needs no calibration machinery on your side, the local path works on any
-firmware.
+*locally in Python*. Both run the same arithmetic — the device runs a
+pre-folded version of it — so use whichever fits: the stream needs no
+calibration machinery on your side, the local path works on any firmware.
+
+They agree **provided the profile document on the unit is current**. The device
+folds in whatever bundle and cap profile Chloros last pushed to it, so a unit
+carrying a stale or wrong-cap document emits a plausible number that is out by
+the whole geometry correction — up to ~11× for a sunshine cap. `daq_cal.py
+<host>` prints exactly what is aboard; see [Caps](#caps).
 
 ## Calibrated output with no cloud and no Chloros — DAQ-E only
 
@@ -347,8 +388,14 @@ number when a cap is fitted but no profile is aboard:
 python record_daq.py e --host 192.168.1.50 --calibrate csv --require-profiles
 ```
 
-None of this applies to a future **DAQ-E-S**, where the sunshine cap is
-permanent and calibrated in, so the correction lives in the gain itself.
+None of this applies to a **DAQ-E-S**, whose diffuser is fitted permanently and
+was on the unit when its factory bundle was measured — the correction is
+already inside the gain. Chloros resolves that unit to `as_recorded` (no
+per-wavelength profile of any kind) and **overrides** any cap you ask for,
+because there is no cap choice to respect on optics that do not come off.
+Putting `sunshine_cosine` on top double-counts the diffuser: measured at ~11×,
+which integrates to 6× the solar constant above the atmosphere — physically
+impossible, and the tell that it has happened.
 
 Use `daq_cal.py <host>` to print exactly which correction chain a unit will
 run — dark model, whether π is applied at runtime or baked into the gain, and

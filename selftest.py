@@ -15,6 +15,7 @@ Two halves:
 
 Run:  python selftest.py
 """
+import contextlib
 import io
 import math
 import os
@@ -49,7 +50,7 @@ def check(name, cond, detail=""):
 
 
 def skip(name, reason):
-    SKIPPED.append(name)
+    SKIPPED.append((name, reason))
     print(f"  [SKIP] {name}  -- {reason}")
 
 
@@ -144,7 +145,8 @@ def chloros_read_daq(path):  # verbatim shape: mip/daq_dls.py meta + als_log rea
         # utc_offset_minutes exists only in v1.23+ recordings.
         cols = {r[1] for r in conn.execute("PRAGMA table_info(als_meta)")}
         wanted = [c for c in ("version", "product_model", "product_serial",
-                              "calibration_applied", "utc_offset_minutes")
+                              "calibration_applied", "calibration_bundle_sha",
+                              "cap_id", "cap_applied", "utc_offset_minutes")
                   if c in cols]
         m = dict(zip(wanted, conn.execute(
             "SELECT %s FROM als_meta LIMIT 1" % ", ".join(wanted)).fetchone()))
@@ -159,7 +161,23 @@ def chloros_read_daq(path):  # verbatim shape: mip/daq_dls.py meta + als_log rea
             'product_model': m.get('product_model'),
             'product_serial': m.get('product_serial'),
             'calibration_applied': bool(m.get('calibration_applied')),
+            'calibration_bundle_sha': m.get('calibration_bundle_sha') or '',
+            'cap_id': m.get('cap_id'),
+            'cap_applied': m.get('cap_applied'),
             'utc_offset_minutes': m.get('utc_offset_minutes')}, specs
+
+
+def chloros_would_calibrate(meta):  # verbatim rule: mip/daq_dls.py:_load_daq
+    """Whether Chloros will apply a bundle to this file on import.
+
+    The whole decision is one column. ``_load_daq`` reads
+    ``als_meta.calibration_applied`` and, when it is 0 and a serial is
+    present, fetches that serial's bundle and multiplies it in. Nothing
+    inspects the spectra to notice they are already irradiance -- there is no
+    signal in the numbers that could tell it, which is why the flag has to be
+    right.
+    """
+    return (not meta['calibration_applied']) and bool(meta['product_serial'])
 
 
 def test_metadata_contract():
@@ -603,6 +621,159 @@ def test_offline_calibration():
           cal.profiles_source == "none" and cal.cap_id == "none")
 
 
+def _chloros_repo():
+    """A mapirlab checkout to cross-check against, or None.
+
+    Env var first, then the sibling directory these two repos are normally
+    cloned into. Absent is the normal case for anyone outside MAPIR, so the
+    live half of the round-trip check skips rather than fails.
+    """
+    cand = os.environ.get("CHLOROS_REPO", "").strip()
+    if not cand:
+        cand = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "mapirlab")
+    return cand if os.path.isfile(os.path.join(cand, "mip", "daq_dls.py"))         else None
+
+
+def test_export_round_trip():
+    """Chloros exports a calibrated .daq; re-importing it must not calibrate
+    it a second time.
+
+    Chloros writes <project>/Light Sensor/<name>_calibrated.daq beside every
+    recording it imports. That file is a valid .daq -- so it can be imported
+    again, deliberately or by a recursive re-import of the project folder --
+    and the ONLY thing standing between it and being multiplied by its bundle
+    a second time is als_meta.calibration_applied. Nothing in the spectra
+    reveals that they are already W/m^2/nm, so a wrong flag squares the
+    correction and reports success.
+    """
+    print("\n-- Chloros export round-trip (no double calibration) --")
+    tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "_selftest_out")
+    os.makedirs(tmp, exist_ok=True)
+    serial = "CB-7C-A8-16-83"
+    counts = np.full(135, 250.0, dtype=np.float32)
+    gain = 4.0                      # stands in for the factory bundle
+    stamps = [1_752_600_000_000_000_000 + i * 1_000_000_000 for i in range(3)]
+
+    # 1. What record_daq.py writes in the field: raw counts, flag clear.
+    raw = os.path.join(tmp, "rt_raw.daq")
+    with mm.DaqWriter(raw, product_model="daq-u", product_serial=serial,
+                      tz_offset_minutes=0) as w:
+        for ts in stamps:
+            w.write(counts, is_saturated=False, integration_time_ms=50,
+                    timestamp_ns=ts)
+    meta_raw, specs_raw = chloros_read_daq(raw)
+    check("raw recording asks Chloros to calibrate it",
+          chloros_would_calibrate(meta_raw))
+
+    # 2. What Chloros writes back out: the same readings, calibrated, with
+    #    the flag SET and the bundle that produced them named.
+    sha = "a" * 64
+    exported = os.path.join(tmp, "rt_raw_calibrated.daq")
+    with mm.DaqWriter(exported, product_model="daq-u", product_serial=serial,
+                      tz_offset_minutes=0, calibration_applied=True,
+                      calibration_bundle_sha=sha,
+                      calibration_completed_utc="2026-01-02T03:04:05+00:00",
+                      cap_applied=False) as w:
+        for ts, (_, spec, _, _) in zip(stamps, specs_raw):
+            w.write(spec * gain, is_saturated=False, integration_time_ms=50,
+                    timestamp_ns=ts)
+
+    meta_exp, specs_exp = chloros_read_daq(exported)
+    check("export declares itself calibrated",
+          meta_exp['calibration_applied'] is True)
+    check("export names the bundle that produced it",
+          meta_exp['calibration_bundle_sha'] == sha)
+    check("re-importing the export does NOT calibrate it again",
+          not chloros_would_calibrate(meta_exp))
+    check("export carries the RECORDING's timezone, not the host's",
+          meta_exp['utc_offset_minutes'] == 0,
+          f"got {meta_exp['utc_offset_minutes']}")
+    check("readings survive the round-trip",
+          len(specs_exp) == len(specs_raw)
+          and all(a[0] == b[0] for a, b in zip(specs_exp, specs_raw))
+          and all(float(a[1][0]) == float(b[1][0]) * gain
+                  for a, b in zip(specs_exp, specs_raw)))
+
+    # 3. Negative control. The same calibrated numbers with the flag CLEAR is
+    #    what a naive export writes -- and it is indistinguishable from a raw
+    #    recording, so import applies the bundle again: gain^2, silently.
+    mislabelled = os.path.join(tmp, "rt_mislabelled.daq")
+    with mm.DaqWriter(mislabelled, product_model="daq-u",
+                      product_serial=serial, tz_offset_minutes=0) as w:
+        for ts, (_, spec, _, _) in zip(stamps, specs_raw):
+            w.write(spec * gain, is_saturated=False, integration_time_ms=50,
+                    timestamp_ns=ts)
+    meta_bad, specs_bad = chloros_read_daq(mislabelled)
+    check("a calibrated file with the flag CLEAR would be calibrated twice",
+          chloros_would_calibrate(meta_bad),
+          "this is the failure the flag exists to prevent")
+    twice = float(specs_bad[0][1][0]) * gain
+    check("...which would be a %gx error" % gain,
+          abs(twice - float(counts[0]) * gain * gain) < 1e-3,
+          f"{counts[0]:g} counts -> {twice:g} instead of "
+          f"{counts[0] * gain:g} W/m^2/nm")
+
+    # 4. DaqWriter refuses to write an unauditable calibrated recording.
+    try:
+        mm.DaqWriter(os.path.join(tmp, "rt_nosha.daq"), product_model="daq-u",
+                     product_serial=serial, calibration_applied=True)
+        ok = False
+    except ValueError:
+        ok = True
+    check("calibration_applied=1 without a bundle sha is refused", ok)
+
+    # 5. Cross-check the rule above against the REAL Chloros reader, when a
+    #    checkout is reachable. The model in this file is a copy, and a copy
+    #    can drift; this is what catches that.
+    repo = _chloros_repo()
+    if repo is None:
+        skip("live cross-check against mip.daq_dls",
+             "set CHLOROS_REPO to a mapirlab checkout")
+        return
+    saved = list(sys.path)
+    try:
+        sys.path.insert(0, repo)
+        from mip.daq_dls import load_calibrated       # noqa: E402
+        scan = load_calibrated(exported)
+        check("real Chloros reader: export reads back as calibrated",
+              scan is not None and scan.calibrated is True)
+        check("real Chloros reader: values unchanged (no second application)",
+              scan is not None
+              and abs(float(scan.spectra[0][0])
+                      - float(counts[0]) * gain) < 1e-3,
+              None if scan is None else f"{float(scan.spectra[0][0]):g}")
+        check("real Chloros reader: bundle sha survives",
+              scan is not None and scan.bundle_sha == sha)
+        # The mislabelled file must NOT be taken at face value. What that
+        # looks like depends on whether this machine can reach a bundle for
+        # the serial, and BOTH outcomes are the correct behaviour:
+        #   bundle available   -> it is applied again; the values move (the
+        #                         squaring this whole check is about) and the
+        #                         sha reported is the fetched bundle's, never
+        #                         the one the file failed to declare.
+        #   bundle unavailable -> calibrated=False; the numbers pass through
+        #                         but are flagged as un-calibrated counts.
+        # Asserting either one alone would make this check machine-dependent.
+        bad = load_calibrated(mislabelled)
+        want = float(counts[0]) * gain
+        got = None if bad is None else float(bad.spectra[0][0])
+        trusted = (bad is not None and bad.calibrated
+                   and bad.bundle_sha == sha and abs(got - want) < 1e-3)
+        if bad is not None and bad.calibrated:
+            detail = (f"a bundle was reachable, so it was applied AGAIN: "
+                      f"{want:g} -> {got:g} W/m^2/nm ({got / want:.3g}x)")
+        else:
+            detail = "no bundle reachable, so it is flagged as raw counts"
+        check("real Chloros reader: the mislabelled file is NOT trusted "
+              "as calibrated", not trusted, detail)
+    except ImportError as e:
+        skip("live cross-check against mip.daq_dls", f"import failed: {e}")
+    finally:
+        sys.path[:] = saved
+
+
 def test_multicast_stream():
     """daq_stream: v1/v2 datagram decode and multi-sensor separation.
 
@@ -616,7 +787,7 @@ def test_multicast_stream():
 
     def frame(ver=2, *, mac=b"\xaa\xbb\xcc\xdd\xee\xff",
               serial=b"\x11\x22\x33\x44\x55", cal=False, seq=3, n=4,
-              integ=50, model=0, corrupt=False):
+              integ=50, model=0, corrupt=False, imu=False):
         if cal:
             payload = struct.pack("<%df" % n, *[1.5] * n)
             flags = 0x02 | 0x08
@@ -637,9 +808,16 @@ def test_multicast_stream():
             d[16:22] = mac; d[22:27] = serial; d[27] = model
             struct.pack_into("<H", d, 28, integ)
             struct.pack_into("<H", d, 30, len(payload))
+        if imu:
+            d[3] |= 0x10          # FLAG_IMU, firmware >= 1.8.0
         d += payload
         crc = ds._crc16_ccitt(bytes(d)) ^ (0xFFFF if corrupt else 0)
         d += struct.pack("<H", crc)
+        if imu:
+            # 22 bytes, from PROTOCOL.md -- a wire fact, written out rather
+            # than read from daq_stream, so this builder still produces a
+            # real DAQ-E-S frame if that module's constant is wrong or absent.
+            d += bytes(22)                     # trailer sits AFTER the crc
         return bytes(d)
 
     f = ds.parse_datagram(frame(2), "10.0.0.5")
@@ -656,6 +834,29 @@ def test_multicast_stream():
     check("calibrated flag set", c["calibrated"])
     check("calibrated payload is float32 irradiance",
           c["spectrum"] == [1.5] * 4)
+
+    # Firmware >= 1.8.0 (every DAQ-E-S) appends a 22-byte IMU trailer AFTER
+    # the crc. An exact-length check rejects those frames wholesale -- the
+    # sensor streams perfectly and reads as absent, its frames counted as
+    # malformed. Chloros hit exactly this and moved to a lower bound on
+    # 2026-08-18; the same rule is required here.
+    with_imu = frame(2, model=1, imu=True)
+    fi = ds.parse_datagram(with_imu, "10.0.0.5")
+    check("a DAQ-E-S frame (IMU trailer after the crc) still parses",
+          fi is not None,
+          "exact-length check would drop every fw>=1.8.0 frame")
+    check("...and its spectrum is intact",
+          fi is not None and fi["spectrum"] == [100.0] * 4)
+    check("...and the trailer's presence is reported",
+          fi is not None and fi.get("has_imu") is True)
+    check("a frame with no trailer reports none",
+          (ds.parse_datagram(frame(2), "x") or {}).get("has_imu") is False)
+    check("a TRUNCATED trailer does not cost the spectrum",
+          (lambda g: g is not None and g["spectrum"] == [100.0] * 4
+           and g["has_imu"] is False)(
+              ds.parse_datagram(with_imu[:-4], "10.0.0.5")),
+          "the trailer rides outside the crc so a bad one must not "
+          "invalidate the frame")
 
     v1 = ds.parse_datagram(frame(1), "10.0.0.5")
     check("v1 still decodes (legacy units keep working)", v1["version"] == 1)
@@ -685,6 +886,104 @@ def test_multicast_stream():
     check("no interleaving between sensors",
           all(len(set(v)) == 1 for v in seen.values()))
 
+    # Dual-stream labelling. Counts and W/m^2/nm differ by ~4 orders of
+    # magnitude, so a CSV that does not record which one it holds is
+    # indistinguishable from the other on inspection -- and there is no
+    # scale at which the mistake announces itself.
+    import csv as _csv
+
+    def _stream_csv(path):
+        """(provenance_line, column_row, first_data_row) from a stream CSV.
+
+        Located by CONTENT, not by row index: a file written without the
+        provenance line still parses here, so the checks below report what is
+        missing instead of dying with an IndexError three frames deep.
+        """
+        rows = list(_csv.reader(open(path, newline="", encoding="utf-8")))
+        prov = rows[0][0] if rows and rows[0] and rows[0][0].startswith("#")             else ""
+        ci = next((i for i, r in enumerate(rows) if r and r[0] == "device"), -1)
+        cols = rows[ci] if ci >= 0 else []
+        data = rows[ci + 1] if 0 <= ci < len(rows) - 1 else []
+        return prov, cols, data
+
+    tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "_selftest_out")
+    os.makedirs(tmp, exist_ok=True)
+    for cal_mode in (False, True):
+        out = os.path.join(tmp, f"stream_{'cal' if cal_mode else 'raw'}.csv")
+        argv = ["--count", "1", "--csv", out, "--quiet",
+                "--duration", "5"] + (["--calibrated"] if cal_mode else [])
+        payload = frame(2, cal=cal_mode)
+
+        class _Sock:
+            def __init__(self): self.n = 0
+            def setsockopt(self, *a): pass
+            def setblocking(self, *a): pass
+            def settimeout(self, *a): pass
+            def bind(self, *a): pass
+            def close(self): pass
+            def recvfrom(self, _n):
+                self.n += 1
+                return payload, ("10.0.0.9", 5002)
+
+        real_socket = ds.socket.socket
+        ds.socket.socket = lambda *a, **k: _Sock()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ds.main(argv)
+        finally:
+            ds.socket.socket = real_socket
+
+        head, cols, data = _stream_csv(out)
+        want = "calibrated W/m^2/nm" if cal_mode else "raw counts"
+        label = "calibrated" if cal_mode else "raw"
+        check(f"{label} CSV names its stream in the file", want in head, head)
+        labelled = "calibrated" in cols and "units" in cols
+        check(f"{label} CSV has a per-frame calibrated column", labelled,
+              "columns: %s" % (cols or "(none found)"))
+        check(f"{label} CSV row states its units",
+              labelled and data[cols.index("units")]
+              == ("W/m^2/nm" if cal_mode else "counts"),
+              data[cols.index("units")] if labelled else "no units column")
+        check(f"{label} CSV calibrated flag comes from the FRAME",
+              labelled and data[cols.index("calibrated")] == str(int(cal_mode)),
+              None if labelled else "no calibrated column")
+
+    # A frame whose flag contradicts the group it arrived on is a firmware
+    # bug, and silently trusting the group would misread counts as irradiance
+    # (or the reverse) by ~1e4. Chloros drops such a frame outright; this
+    # script keeps it but must SAY so, and must record the frame's own flag.
+    payload = frame(2, cal=True)          # calibrated frame...
+
+    class _Sock2:
+        def setsockopt(self, *a): pass
+        def setblocking(self, *a): pass
+        def settimeout(self, *a): pass
+        def bind(self, *a): pass
+        def close(self): pass
+        def recvfrom(self, _n): return payload, ("10.0.0.9", 5002)
+
+    out = os.path.join(tmp, "stream_mismatch.csv")
+    real_socket = ds.socket.socket
+    ds.socket.socket = lambda *a, **k: _Sock2()
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()),                 contextlib.redirect_stderr(err):
+            ds.main(["--count", "1", "--csv", out, "--quiet",
+                     "--duration", "5"])     # ...on the RAW subscription
+    finally:
+        ds.socket.socket = real_socket
+
+    check("a calibrated frame on the raw group is reported",
+          "WARNING" in err.getvalue() and "raw group" in err.getvalue(),
+          err.getvalue().strip()[:90] or "(nothing on stderr)")
+    _, cols, data = _stream_csv(out)
+    labelled = "calibrated" in cols and "units" in cols
+    check("...and the CSV records the FRAME's flag, not the group's",
+          labelled and data[cols.index("calibrated")] == "1"
+          and data[cols.index("units")] == "W/m^2/nm",
+          None if labelled else "the CSV has no calibrated/units column")
+
 
 def main():
     test_metadata_contract()
@@ -693,12 +992,15 @@ def main():
     test_cable_sync_ordering()
     test_camera_capture_flow()
     test_offline_calibration()
+    test_export_round_trip()
     test_multicast_stream()
     n = sum(RESULTS)
     print(f"\n==== {n}/{len(RESULTS)} checks passed ====")
     if SKIPPED:
-        print(f"     ({len(SKIPPED)} TIFF read-back check group(s) skipped -- "
-              f"`pip install tifffile` to run the full self-test)")
+        print(f"     ({len(SKIPPED)} optional check group(s) skipped:")
+        for name, reason in SKIPPED:
+            print(f"        {name} -- {reason}")
+        print("     )")
     return 0 if n == len(RESULTS) else 1
 
 

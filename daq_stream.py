@@ -66,6 +66,11 @@ FLAG_SATURATED = 0x01
 FLAG_ABS_TS = 0x02
 FLAG_PTP = 0x04
 FLAG_CALIBRATED = 0x08
+# Firmware >= 1.8.0 appends a 22-byte IMU trailer AFTER the crc, announced by
+# this bit. It rides outside the crc precisely so a bad trailer cannot cost a
+# good spectrum -- which also means a reader must tolerate the extra bytes.
+FLAG_IMU = 0x10
+IMU_TRAILER_LEN = 22
 
 
 def _crc16_ccitt(data: bytes) -> int:
@@ -104,7 +109,15 @@ def parse_datagram(data: bytes, src_ip: str = "") -> Optional[dict]:
     else:
         return None
 
-    if hdr + plen + 2 != len(data):
+    # LOWER BOUND, not equality. An equality test here silently rejects
+    # EVERY frame from a DAQ-E-S (and any DAQ-E on firmware >= 1.8.0 with the
+    # IMU trailer on): those frames are 22 bytes longer than the spectral
+    # datagram, so they fall through to the malformed counter and the sensor
+    # looks absent while streaming perfectly. Chloros hit exactly this and
+    # fixed it on 2026-08-18 (daq/sensors/e.py) -- the same rule is required
+    # here, and anything appended after the crc in future must stay
+    # compatible with it.
+    if hdr + plen + 2 > len(data):
         return None
     if struct.unpack_from("<H", data, hdr + plen)[0] != _crc16_ccitt(data[:hdr + plen]):
         return None
@@ -112,6 +125,16 @@ def parse_datagram(data: bytes, src_ip: str = "") -> Optional[dict]:
     flags = data[3]
     payload = data[hdr:hdr + plen]
     calibrated = bool(flags & FLAG_CALIBRATED)
+
+    # Presence only. The trailer carries the unit's attitude (tilt / roll /
+    # pitch), which decides whether a cosine-corrected downwelling reading is
+    # trustworthy -- but decoding it here would be a second copy of a layout
+    # that must not drift, so this script reports that it is there and leaves
+    # the decode to Chloros. Layout in PROTOCOL.md. A TRUNCATED trailer reads
+    # as absent rather than invalidating the frame: it sits outside the crc
+    # exactly so a bad one cannot cost a good spectrum.
+    has_imu = (bool(flags & FLAG_IMU)
+               and len(data) >= hdr + plen + 2 + IMU_TRAILER_LEN)
 
     spectrum = None
     if calibrated:
@@ -131,6 +154,7 @@ def parse_datagram(data: bytes, src_ip: str = "") -> Optional[dict]:
         "ptp_synced": bool(flags & FLAG_PTP),
         "saturated": bool(flags & FLAG_SATURATED),
         "calibrated": calibrated,
+        "has_imu": has_imu,
         "mac": mac,
         "sensor_serial": serial,
         "model": model,
@@ -250,13 +274,23 @@ def main(argv=None):
     if args.csv:
         csv_fh = open(args.csv, "w", newline="", encoding="utf-8")
         csv_out = csv.writer(csv_fh)
+        # Say which stream this came from, in the file. The two groups carry
+        # numbers that differ by the whole calibration -- counts vs W/m^2/nm,
+        # four orders of magnitude apart -- and a CSV that does not record
+        # which one it holds is indistinguishable from the other on
+        # inspection. The per-row `calibrated` column below is the
+        # authoritative one (it is the frame's own flag, not this argument),
+        # but a reader opening the file wants to know at the top.
+        _units = "calibrated W/m^2/nm" if args.calibrated else "raw counts"
+        csv_out.writerow([f"# MAPIR DAQ-E multicast {group}:{port} -- {_units}"])
         csv_out.writerow(["device", "serial", "model", "seq", "timestamp_us",
-                          "ptp", "integration_ms", "saturated", "n_points",
-                          "spectrum..."])
+                          "ptp", "integration_ms", "saturated", "calibrated",
+                          "units", "imu", "n_points", "spectrum..."])
 
     n = 0
     t0 = time.monotonic()
     bad = 0
+    mislabelled_warned = False
     try:
         while True:
             if args.duration and (time.monotonic() - t0) >= args.duration:
@@ -271,6 +305,26 @@ def main(argv=None):
                 continue
             if wanted and (f["sensor_serial"] or "").upper() not in wanted:
                 continue
+
+            # The two groups are supposed to be exclusive, so a frame whose
+            # own FLAG_CALIBRATED bit disagrees with the group it arrived on
+            # means the firmware is emitting on the wrong one. That is a
+            # 4-orders-of-magnitude error if it goes unnoticed -- counts read
+            # as W/m^2/nm or vice versa -- so say it, once, loudly. Chloros
+            # makes the same check on its own raw subscription and drops the
+            # frame outright (daq/sensors/e.py); this script keeps it, because
+            # the per-row `calibrated` column records what actually arrived
+            # rather than what the group implies.
+            if f["calibrated"] != args.calibrated and not mislabelled_warned:
+                mislabelled_warned = True
+                want = "calibrated" if args.calibrated else "raw"
+                got = "calibrated" if f["calibrated"] else "raw"
+                print(f"! WARNING: {group}:{port} is the {want} group but "
+                      f"this frame is flagged {got} "
+                      f"({f['sensor_serial'] or addr[0]}). The CSV records "
+                      f"each frame's own flag; treat the units with "
+                      f"suspicion and check the unit's firmware.",
+                      file=sys.stderr, flush=True)
 
             key = f["device_key"]
             st = devices.get(key)
@@ -290,6 +344,13 @@ def main(argv=None):
                     [key, f["sensor_serial"] or "", f["model"] or "",
                      f["seq"], f["timestamp_us"], int(f["ptp_synced"]),
                      f["integration_time_ms"] or "", int(f["saturated"]),
+                     # Per FRAME, from its own flag bit -- not from which
+                     # group we happened to join. If a unit ever emits the
+                     # wrong thing on a group, the file still describes what
+                     # actually arrived.
+                     int(f["calibrated"]),
+                     "W/m^2/nm" if f["calibrated"] else "counts",
+                     int(f["has_imu"]),
                      len(f["spectrum"])]
                     + ["%.6g" % v for v in f["spectrum"]])
 
