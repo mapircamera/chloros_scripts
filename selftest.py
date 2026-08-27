@@ -939,11 +939,11 @@ def test_stream_recording():
         d += struct.pack("<H", ds._crc16_ccitt(bytes(d)))
         return bytes(d) + _trailer()
 
-    def _attitude():
+    def _attitude(seq=42, ts_us=1_752_600_000_000_000):
         d = bytearray(58)
         d[0:2] = b"\xda\x0e"; d[2] = 0x03; d[3] = 0x02 | 0x04
-        struct.pack_into("<I", d, 4, 42)
-        struct.pack_into("<Q", d, 8, 1_752_600_000_000_000)
+        struct.pack_into("<I", d, 4, seq)
+        struct.pack_into("<Q", d, 8, ts_us)
         d[16:22] = b"\xaa\xbb\xcc\xdd\xee\xff"
         d[22:27] = b"\x11\x22\x33\x44\x55"
         d[27] = 1
@@ -1021,15 +1021,86 @@ def test_stream_recording():
           data[hdr.index("tilt_deg")] == "2.5"
           and data[hdr.index("roll_deg")] == "-1.25")
 
-    def _refuses_daq():
+    # Attitude into a .daq: its own event_type, no spectrum, inert to every
+    # reader that is looking for spectra.
+    adq = os.path.join(tmp, "stream_rec_imu.daq")
+    _run(["--imu", "--daq", adq, "--count", "3", "--quiet", "--imu-rate", "0",
+          "--duration", "5"], _attitude())
+    conn = _sq.connect(adq)
+    kinds = dict(conn.execute(
+        "SELECT event_type, COUNT(*) FROM als_log GROUP BY event_type"))
+    arow = conn.execute("SELECT spectral_data, imu_tilt_deg, imu_roll_deg "
+                        "FROM als_log WHERE event_type=4 LIMIT 1").fetchone()
+    conn.close()
+    check("attitude -> .daq under its OWN event type, not as spectra",
+          kinds == {4: 3}, str(kinds))
+    check("...carrying no spectrum, and the decoded angles",
+          arow == (None, 2.5, -1.25), str(arow))
+    # THE safety property. An attitude row that any spectral reader mistook
+    # for a reading would put a phantom into the downwelling.
+    _, specs = chloros_read_daq(adq)
+    check("...and no spectral reader counts them as readings", specs == [],
+          f"{len(specs)} phantom spectrum(s)")
+
+    # --- rate control -------------------------------------------------
+    # The device streams ~50 Hz and every sample is a row in BOTH outputs.
+    # Most work does not need that, so the default thins it.
+    _step_us = 20_000                       # 50 Hz
+    _frames = [_attitude(seq=i, ts_us=1_752_600_000_000_000 + i * _step_us)
+               for i in range(20)]          # 0.4 s of samples
+
+    def _kept(rate):
+        """(count, timestamps) written at *rate*; None = use the default."""
+        tag = "def" if rate is None else str(rate).replace(".", "_")
+        out = os.path.join(tmp, "rate_%s.daq" % tag)
+        argv = ["--imu", "--count", str(len(_frames)), "--daq", out,
+                "--quiet", "--duration", "30"]
+        if rate is not None:
+            argv += ["--imu-rate", str(rate)]
+        box = {"i": 0}
+
+        class _S:
+            def setsockopt(self, *a): pass
+            def setblocking(self, *a): pass
+            def settimeout(self, *a): pass
+            def bind(self, *a): pass
+            def close(self): pass
+            def recvfrom(self, _n):
+                fr = _frames[min(box["i"], len(_frames) - 1)]
+                box["i"] += 1
+                return fr, ("10.0.0.9", 5004)
+        real = ds.socket.socket
+        ds.socket.socket = lambda *a, **k: _S()
         try:
-            _run(["--imu", "--daq", os.path.join(tmp, "no.daq"), "--count",
-                  "1", "--quiet"], _attitude())
-            return False
-        except SystemExit:
-            return True
-    check("attitude is REFUSED a .daq, with the reason", _refuses_daq(),
-          "an als_log row with no spectral_data is invisible to Chloros")
+            with contextlib.redirect_stdout(io.StringIO()):
+                ds.main(argv)
+        finally:
+            ds.socket.socket = real
+        c = _sq.connect(out)
+        ts = [r[0] for r in c.execute("SELECT precise_timestamp FROM als_log "
+                                      "WHERE event_type=4 ORDER BY id")]
+        c.close()
+        return len(ts), ts
+
+    n_all, _ = _kept(0)
+    check("--imu-rate 0 keeps every sample the device sent",
+          n_all == len(_frames), str(n_all))
+
+    n_5, ts_5 = _kept(5)
+    check("--imu-rate 5 thins a 50 Hz stream to 5 Hz", n_5 == 2, str(n_5))
+    # precise_timestamp is NANOseconds; 1/5 Hz is 0.2 s.
+    gaps = [(b - a) / 1e9 for a, b in zip(ts_5, ts_5[1:])]
+    check("...spaced by the samples' OWN timestamps, not a frame counter",
+          gaps and all(abs(g - 0.2) < 1e-6 for g in gaps),
+          "a counter would drift with the device's actual rate; gaps(s)="
+          + str(gaps))
+
+    n_def, _ = _kept(None)
+    check("thinning is the DEFAULT, so an unattended run stays small",
+          n_def == n_5,
+          f"default kept {n_def}, --imu-rate 5 kept {n_5}, full rate is "
+          f"{len(_frames)}")
+    check("...and a higher rate really does keep more", _kept(25)[0] > n_def)
 
     # An undefined angle must stay empty, never 0 -- 0 degrees means
     # PERFECTLY LEVEL, the single most dangerous value to invent for a column

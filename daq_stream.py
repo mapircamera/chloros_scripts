@@ -428,7 +428,10 @@ def _open_daq(args, frame):
     """
     from mapir_metadata import DaqWriter
 
-    calibrated = bool(frame["calibrated"])
+    # An attitude-only recording carries no spectra at all, so
+    # calibration_applied has nothing to describe -- 0 is the honest answer
+    # and Chloros's spectral readers never look at the file anyway.
+    calibrated = bool(frame.get("calibrated")) and not args.imu
     model = args.serial_model or frame.get("model") or "daq-e"
     serial = frame.get("sensor_serial")
     if not serial:
@@ -453,8 +456,9 @@ def _open_daq(args, frame):
         )
     w = DaqWriter(args.daq, product_model=model, product_serial=serial,
                   device_name=frame.get("mac") or "", **kwargs)
-    print(f"  recording {'CALIBRATED' if calibrated else 'RAW'} frames to "
-          f"{args.daq}", flush=True)
+    _what = ("ATTITUDE" if args.imu else
+             "CALIBRATED" if calibrated else "RAW")
+    print(f"  recording {_what} frames to {args.daq}", flush=True)
     return w, args.daq
 
 
@@ -479,12 +483,24 @@ def main(argv=None):
                         "declares what the stream actually carried: a "
                         "calibrated stream is stamped calibration_applied=1 "
                         "so Chloros imports it as-is instead of calibrating "
-                        "it a second time.")
+                        "it a second time. With --imu the samples are written "
+                        "as event_type=4 attitude rows (no spectrum), at the "
+                        "thinned to --imu-rate.")
     p.add_argument("--imu", action="store_true",
-                   help="listen to the standalone attitude stream "
+                   help="record the standalone attitude stream "
                         "(239.10.10.12:5004, firmware 1.12+) instead of "
-                        "spectra -- full accelerometer rate rather than the "
-                        "~2.5 Hz the spectral trailer delivers. CSV only.")
+                        "spectra. The accelerometer samples far faster than "
+                        "spectra arrive, so this is the only way to get "
+                        "attitude at better than the ~2.5 Hz the per-frame "
+                        "trailer allows. Writes --csv and/or --daq; see "
+                        "--imu-rate for how much of it is kept.")
+    p.add_argument("--imu-rate", metavar="HZ", type=float, default=5.0,
+                   help="with --imu: attitude samples per second to KEEP "
+                        "(default 5). The device streams at ~50 Hz, which is "
+                        "more than most work needs and ten times the rows in "
+                        "both outputs, so samples are thinned to this rate BY "
+                        "THEIR OWN TIMESTAMPS. Raise it for vibration or "
+                        "fast-attitude work; 0 keeps every sample sent.")
     p.add_argument("--serial-model", metavar="MODEL",
                    help="with --daq: override the product_model "
                         "stamped (daq-e / daq-e-s). Default: whatever "
@@ -502,13 +518,6 @@ def main(argv=None):
                    help="suppress per-frame lines; print the summary only")
     args = p.parse_args(argv)
 
-    if args.imu and args.daq:
-        raise SystemExit(
-            "--imu cannot be written to a .daq: an attitude sample is not a "
-            "spectrum, and Chloros only reads als_log rows that HAVE "
-            "spectral_data. Record attitude to --csv, or record spectra with "
-            "--daq -- a DAQ-E-S folds its attitude into those frames as a "
-            "trailer, and that DOES land in the .daq's imu_* columns.")
     if args.imu and args.calibrated:
         raise SystemExit("--imu and --calibrated are different streams; "
                          "pick one.")
@@ -555,6 +564,13 @@ def main(argv=None):
 
     daq_writer = None
     daq_path = None
+    # Attitude thinning. Gated on each sample's OWN timestamp rather than
+    # a keep-every-Nth counter: the device's rate is nominal, not
+    # guaranteed, so a counter would silently change the output rate
+    # whenever the device's drifted. 0 (or negative) keeps everything.
+    imu_min_gap_us = (1e6 / args.imu_rate) if args.imu_rate > 0 else 0.0
+    imu_last_us = None
+    imu_dropped = 0
 
     n = 0
     t0 = time.monotonic()
@@ -599,6 +615,18 @@ def main(argv=None):
                       f"suspicion and check the unit's firmware.",
                       file=sys.stderr, flush=True)
 
+            # Thin attitude to the requested rate before anything writes
+            # it. Standalone stream only -- the per-frame trailer already
+            # arrives at the spectral rate (~2.5 Hz) and costs no extra
+            # rows, being columns on a row that exists anyway.
+            if args.imu and imu_min_gap_us:
+                _t = f["timestamp_us"]
+                if (imu_last_us is not None
+                        and (_t - imu_last_us) < imu_min_gap_us):
+                    imu_dropped += 1
+                    continue
+                imu_last_us = _t
+
             key = f["device_key"]
             st = devices.get(key)
             if st is None:
@@ -633,11 +661,25 @@ def main(argv=None):
                      len(f["spectrum"])]
                     + ["%.6g" % v for v in f["spectrum"]])
 
+            # --- .daq: attitude ------------------------------------------
+            if args.daq and args.imu:
+                if daq_writer is None:
+                    daq_writer, daq_path = _open_daq(args, f)
+                if daq_writer is not None:
+                    daq_writer.write_attitude(
+                        f,
+                        timestamp_ns=(f["timestamp_us"] * 1000
+                                      if f["absolute_time"]
+                                      else time.time_ns()),
+                        device_timestamp_ns=(f["timestamp_us"] * 1000
+                                             if f["absolute_time"] else None),
+                        device_ts_ptp=f["ptp_synced"])
+
             # --- .daq ---------------------------------------------------
             # Opened on the FIRST frame, not up front: the model and serial
             # it has to declare come off the wire, and a v1 unit reports
             # neither. Opening early would mean inventing them.
-            if args.daq and f["spectrum"] is not None:
+            if args.daq and not args.imu and f["spectrum"] is not None:
                 if daq_writer is None:
                     daq_writer, daq_path = _open_daq(args, f)
                 if daq_writer is not None:
@@ -678,7 +720,9 @@ def main(argv=None):
             daq_writer.close()
 
     print(f"\n{len(devices)} sensor(s), {n} frame(s)"
-          + (f", {bad} malformed datagram(s)" if bad else ""))
+          + (f", {bad} malformed datagram(s)" if bad else "")
+          + (f", {imu_dropped} sample(s) thinned to {args.imu_rate:g} Hz"
+             if imu_dropped else ""))
     for st in devices.values():
         loss = (100.0 * st.dropped / (st.frames + st.dropped)
                 if (st.frames + st.dropped) else 0.0)
@@ -687,10 +731,14 @@ def main(argv=None):
     if args.csv:
         print(f"\nCSV: {args.csv}")
     if daq_path:
-        print(f"DAQ: {daq_path}  ({daq_writer.record_count} reading(s), "
-              f"cap={daq_writer.cap_id})")
+        _n = (daq_writer.attitude_count if args.imu
+              else daq_writer.record_count)
+        _kind = "attitude sample(s)" if args.imu else "reading(s)"
+        print(f"DAQ: {daq_path}  ({_n} {_kind}"
+              + ("" if args.imu else f", cap={daq_writer.cap_id}") + ")")
     elif args.daq:
-        print("DAQ: nothing written -- no spectral frames arrived.")
+        print("DAQ: nothing written -- no %s arrived."
+              % ("attitude samples" if args.imu else "spectral frames"))
     return 0
 
 

@@ -284,6 +284,16 @@ _IMU_COLUMNS = (
 
 _VALID_KINDS = ("daq-u", "daq-m", "daq-e", "daq-e-s")
 
+# als_log.event_type. A .daq is a multi-kind log, not a spectrum table.
+EVENT_SPECTRUM = 3
+# Attitude, at the accelerometer's own rate. A DAQ-E-S samples at 50 Hz while
+# spectra arrive at ~2.5 Hz, so recording attitude at full rate necessarily
+# means rows that carry no spectrum. Every Chloros spectral reader either
+# predicates on event_type=3 (mip/daq_dls) or skips rows whose blob will not
+# decode (mip/als.py), so these are inert to all of them -- see
+# tests/daq_validator.py KNOWN_EVENT_TYPES.
+EVENT_ATTITUDE = 4
+
 # The cap correction Chloros will apply when a recording does not say
 # otherwise, per device model.
 #
@@ -531,6 +541,7 @@ class DaqWriter:
              int(tz_offset_minutes)))
         self._conn.commit()
         self._count = 0
+        self._attitude_count = 0
 
     def write(self, spectrum, is_saturated, integration_time_ms,
               timestamp_ns=None, *, device_timestamp_ns=None,
@@ -593,12 +604,66 @@ class DaqWriter:
             "spectral_data, is_saturated, integration_time, "
             "device_ts_ns, device_ts_ptp, " + ", ".join(_IMU_COLUMNS) + ") "
             "VALUES (?,?,?,?,?, ?,?, ?,?,?,?,?,?,?,?,?,?,?,?)",
-            (3, int(timestamp_ns), _spectrum_to_blob(spectrum),
+            (EVENT_SPECTRUM, int(timestamp_ns), _spectrum_to_blob(spectrum),
              int(bool(is_saturated)), int(integration_time_ms),
              dev_ts, dev_ptp) + imu_row)
         self._count += 1
         if self._count % 10 == 0:
             self._conn.commit()
+
+    def write_attitude(self, imu, timestamp_ns=None, *,
+                       device_timestamp_ns=None, device_ts_ptp=None):
+        """Append one ATTITUDE sample -- no spectrum.
+
+        For the DAQ-E-S's standalone attitude stream, which runs at the
+        accelerometer's own ~50 Hz while spectra arrive at ~2.5 Hz. Folding
+        those samples into spectral rows would throw 19 of every 20 away,
+        which is the whole reason that stream exists; so they get their own
+        rows, marked ``event_type = EVENT_ATTITUDE`` and carrying no
+        ``spectral_data``.
+
+        Inert to every Chloros spectral reader: ``mip/daq_dls`` predicates on
+        ``event_type = 3 AND spectral_data IS NOT NULL``, and ``mip/als.py``
+        skips rows whose blob will not decode. Nothing in Chloros READS these
+        yet -- they are recorded so the data exists on the same clock and in
+        the same file as the spectra it qualifies, rather than being stranded
+        in a sidecar.
+        """
+        if self._conn is None:
+            raise RuntimeError("DaqWriter is closed")
+        if not isinstance(imu, dict):
+            raise ValueError("write_attitude needs a parsed attitude dict "
+                             "(daq_stream.parse_imu_datagram / "
+                             "parse_imu_trailer)")
+        if timestamp_ns is None:
+            timestamp_ns = time.time_ns()
+        dev_ts = dev_ptp = None
+        if device_timestamp_ns:
+            _v = int(device_timestamp_ns)
+            if _v > 946684800_000_000_000:
+                dev_ts = _v
+                dev_ptp = 1 if device_ts_ptp else 0
+        self._conn.execute(
+            "INSERT INTO als_log (event_type, precise_timestamp, "
+            "spectral_data, is_saturated, integration_time, "
+            "device_ts_ns, device_ts_ptp, " + ", ".join(_IMU_COLUMNS) + ") "
+            "VALUES (?,?,?,?,?, ?,?, ?,?,?,?,?,?,?,?,?,?,?,?)",
+            (EVENT_ATTITUDE, int(timestamp_ns), None, 0, None,
+             dev_ts, dev_ptp,
+             _as_int(imu.get("trailer_version")), _as_int(imu.get("flags")),
+             1 if imu.get("cal_applied") else 0,
+             _as_int(imu.get("sample_age_ms")),
+             _as_float(imu.get("x_mg")), _as_float(imu.get("y_mg")),
+             _as_float(imu.get("z_mg")), _as_float(imu.get("mag_mg")),
+             _as_float(imu.get("tilt_deg")), _as_float(imu.get("roll_deg")),
+             _as_float(imu.get("pitch_deg")), _as_int(imu.get("temp_raw"))))
+        self._attitude_count += 1
+        if (self._count + self._attitude_count) % 10 == 0:
+            self._conn.commit()
+
+    @property
+    def attitude_count(self):
+        return self._attitude_count
 
     @property
     def cap_id(self):

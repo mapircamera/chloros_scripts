@@ -249,20 +249,41 @@ Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blo
 |---|:---:|:---:|---|
 | Raw spectra | ✅ | ✅ | `record_daq.py <k> --csv` (any model) or `daq_stream.py --daq --csv` (DAQ-E) |
 | Calibrated spectra | ✅ | ✅ | `daq_stream.py --calibrated --daq --csv`, or `record_daq.py e --calibrate bake`/`csv` |
-| Attitude (IMU) | trailer only | ✅ | `daq_stream.py --imu --csv`; the per-frame trailer lands in the `.daq`'s `imu_*` columns automatically |
+| Attitude (IMU) | ✅ | ✅ | `daq_stream.py --imu --daq --csv`; the per-frame trailer also lands in a spectral `.daq`'s `imu_*` columns automatically |
 
 A calibrated recording is **stamped as calibrated** (`calibration_applied = 1`)
 from the frame's own flag bit, not from which group you joined — so Chloros
 imports it as-is instead of applying its bundle a second time.
 
-The standalone attitude stream is CSV-only, and asking for `--daq` there is
-refused with the reason: Chloros reads `als_log` rows that have
-`spectral_data`, and an attitude sample is not a spectrum. That is not a gap —
-attitude that needs to travel *with* an irradiance reading already does, as the
-per-frame trailer, and that lands in the `.daq` beside the spectrum it
-qualifies. The standalone stream exists for full-rate attitude (the trailer
-only delivers at the ~2.5 Hz spectra arrive at, while the accelerometer samples
-at 50 Hz).
+Attitude arrives two ways, and both are recorded:
+
+- **On each spectral frame**, as a 22-byte trailer. It lands in that reading's
+  own `imu_*` columns, so the tilt sits beside the irradiance it qualifies. Free
+  — no extra rows — but limited to the ~2.5 Hz spectra arrive at.
+- **On its own stream**, at the accelerometer's rate (~50 Hz). `--imu` records
+  it as `event_type = 4` rows carrying no spectrum. Chloros's spectral readers
+  never see them: `mip/daq_dls` predicates on `event_type = 3 AND spectral_data
+  IS NOT NULL`, and `mip/als.py` skips rows whose blob will not decode. Nothing
+  in Chloros reads them back *yet* — they are recorded so the data exists on the
+  same clock and in the same file as the spectra, instead of stranded in a
+  sidecar.
+
+**`--imu-rate` decides how much of that you keep, and it defaults to 5 Hz.**
+50 Hz is ten times the rows in both outputs and more than most work needs, so
+samples are thinned by their own timestamps (not by a frame counter, which
+would drift whenever the device's actual rate did). Raise it for vibration or
+fast-attitude work; `--imu-rate 0` keeps every sample.
+
+```bash
+# the default: 5 Hz, small files
+python daq_stream.py --imu --daq attitude.daq --csv attitude.csv
+
+# everything the device sends
+python daq_stream.py --imu --imu-rate 0 --daq attitude.daq
+```
+
+Measured on a 50 Hz stream: 5 Hz keeps a tenth of the samples and about a tenth
+of the CSV bytes.
 
 Raw remains the reprocessable master either way: a coefficient revision reaches
 every raw recording you kept and none of the device-calibrated ones.
