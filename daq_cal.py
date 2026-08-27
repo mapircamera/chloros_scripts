@@ -54,6 +54,7 @@ the sign is already decided at that point.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import socket
@@ -635,6 +636,135 @@ def _parse_profiles(doc: Dict[str, Any]):
 # ---------------------------------------------------------------------------
 # CLI -- inspect a device's onboard calibration without recording anything
 # ---------------------------------------------------------------------------
+# The profiles document's shape, byte-for-byte what Chloros builds
+# (daq/device_sync.py:build_profiles_document). Matching it matters: the
+# device reports the document's sha, and Chloros rewrites flash whenever that
+# sha differs from what IT would produce. A document that differs only
+# cosmetically means every Chloros connect rewrites flash for nothing.
+CHAIN_VERSION = 1
+
+
+def build_profiles_document(device_kind, cap_id, cap_profile=None,
+                            dark_fraction=None):
+    """The document a DAQ-E stores, for :func:`set_device_cap`.
+
+    ``cap_profile`` is the verbatim contents of a Chloros cap-profile JSON
+    (``daq/cap_profiles/<kind>/<cap>.json``) -- shipped as-is rather than
+    re-serialised from parsed arrays, so a loader change on either side cannot
+    silently alter what the device carries. ``None`` is correct only for
+    ``as_recorded``; every other id needs its curve, because the device
+    applies what it is given and has no library to look one up in.
+
+    Deliberately carries no timestamp: the sha IS the document's identity, so
+    a field that changes every second would make every write look new.
+    """
+    kind = str(device_kind or "e").strip().lower()
+    kind = kind[-1] if kind.startswith("daq-") else kind
+    cap_id = (cap_id or CAP_ID_NONE).strip() or CAP_ID_NONE
+    doc = {
+        "schema_version": PROFILES_SCHEMA_VERSION,
+        "chain_version": CHAIN_VERSION,
+        "device_kind": kind,
+        "cap_id": cap_id,
+        "cap_profile": None,
+    }
+    if cap_id != CAP_ID_AS_RECORDED and cap_profile:
+        doc["cap_profile"] = cap_profile
+    if dark_fraction is not None:
+        doc["dark_fraction"] = dark_fraction
+    return doc
+
+
+def _canonical_json(obj) -> str:
+    """Stable bytes for content hashing.
+
+    Must match Chloros's ``daq/device_sync.py::_canonical_json`` EXACTLY --
+    indent, key order, unicode handling and the trailing newline included.
+    The sha over these bytes is the document's identity: it is what the device
+    reports in ``status`` and what Chloros compares against to decide whether
+    to write. A serialisation that differs only cosmetically produces a
+    different sha for identical content, so every Chloros connect would
+    rewrite flash and report a change that never happened.
+    """
+    return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def set_device_cap(ctrl, cap_id, *, cap_profile=None, device_kind="e",
+                   dark_fraction=None):
+    """Write which cap a DAQ-E applies to its own calibrated stream.
+
+    The device folds this into the W/m^2/nm it publishes on the calibrated
+    multicast group and into what ``--calibrate`` reads back, so it is the one
+    knob that decides whether an offline consumer of that stream gets the
+    truth. Requires firmware with ``set_profiles`` (v1.6.0+).
+
+    Returns the response dict. Raises :class:`CalibrationError` if the device
+    refuses the write or the document does not land intact.
+
+    NOTE: this is not the last word. Chloros re-pushes its OWN resolved cap
+    whenever it connects to the unit and finds a different document sha, so a
+    cap set here survives only until the next Chloros connect. Set it in
+    Chloros if you want it to stick.
+    """
+    if cap_id != CAP_ID_AS_RECORDED and not cap_profile:
+        raise CalibrationError(
+            f"cap_id={cap_id!r} needs its correction curve: pass the matching "
+            f"cap-profile JSON (Chloros ships them at "
+            f"daq/cap_profiles/<kind>/{cap_id}.json). Only "
+            f"{CAP_ID_AS_RECORDED!r} -- apply no profile at all -- can be set "
+            f"without one, because it carries no curve to apply.")
+
+    # Carry the unit's existing dark_fraction forward unless told otherwise.
+    # Chloros sources that number from its fleet table, which these scripts do
+    # not have -- so dropping it would produce a document that differs from
+    # what Chloros builds for the same cap, and every Chloros connect would
+    # then rewrite flash to put it back. Reading it off the device costs one
+    # call and keeps the two byte-identical.
+    if dark_fraction is None:
+        try:
+            prev = ctrl.cmd({"cmd": "get_profiles"})
+            if prev.get("ok"):
+                prev_doc = json.loads(prev.get("profiles_json") or "{}")
+                if isinstance(prev_doc.get("dark_fraction"), dict):
+                    dark_fraction = prev_doc["dark_fraction"]
+        except (OSError, ValueError):
+            # No document aboard yet, or unreadable. Proceed without one --
+            # that is what Chloros writes when its own lookup finds nothing.
+            dark_fraction = None
+
+    doc = build_profiles_document(device_kind, cap_id, cap_profile,
+                                  dark_fraction)
+    body = _canonical_json(doc)
+    sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    resp = ctrl.cmd({"cmd": "set_profiles", "sha256": sha,
+                     "profiles_json": body,
+                     "coeff_schema_version": PROFILES_SCHEMA_VERSION,
+                     "cap_id": doc["cap_id"]})
+    if not resp.get("ok"):
+        raise CalibrationError(
+            f"device refused set_profiles: {resp.get('error') or resp} "
+            f"[{resp.get('code', '')}]")
+    # Firmware >= 1.6 hashes what actually reached flash. Older firmware just
+    # echoes ours back, which proves nothing about the write -- so for those
+    # read the document back and re-hash it here.
+    if not resp.get("verified"):
+        if resp.get("sha256") != sha:
+            raise CalibrationError(
+                f"device echoed a different sha after write "
+                f"(sent={sha[:12]}... got={str(resp.get('sha256'))[:12]}...)")
+        back = ctrl.cmd({"cmd": "get_profiles"})
+        if not back.get("ok"):
+            raise CalibrationError(
+                f"device refused get_profiles after a successful write: "
+                f"{back.get('error') or back}")
+        got = back.get("profiles_json", "")
+        if hashlib.sha256(got.encode("utf-8")).hexdigest() != sha:
+            raise CalibrationError(
+                "read-back sha does not match what was written -- the "
+                "on-device copy is corrupt")
+    return resp
+
+
 def main(argv=None):
     import argparse
 
@@ -649,13 +779,48 @@ def main(argv=None):
                    help="also write the raw bundle JSON here")
     p.add_argument("--require-profiles", action="store_true",
                    help="fail if the device has no cap/geometry profiles")
+    p.add_argument("--set-cap", metavar="CAP_ID",
+                   help="WRITE which cap this DAQ-E applies to its own "
+                        "calibrated stream (firmware 1.6.0+). Needs "
+                        "--cap-profile for any real cap; 'as_recorded' "
+                        "(apply no profile at all) needs nothing. Chloros "
+                        "re-pushes its own resolved cap on its next connect, "
+                        "so set it in Chloros if it must stick.")
+    p.add_argument("--cap-profile", metavar="PATH",
+                   help="the cap's correction curve, as shipped by Chloros at "
+                        "daq/cap_profiles/<kind>/<cap_id>.json. Required by "
+                        "--set-cap for anything but 'as_recorded': the device "
+                        "applies what it is given and has no library to look "
+                        "a curve up in.")
+    p.add_argument("--save-profiles", metavar="PATH",
+                   help="write the device's current profiles document here "
+                        "(the cap curve it is actually applying)")
     args = p.parse_args(argv)
 
     with DaqEControlClient(args.host, port=args.control_port,
                            token=args.token) as ctrl:
         status = ctrl.cmd({"cmd": "status"})
+
+        if args.set_cap:
+            profile = None
+            if args.cap_profile:
+                with open(args.cap_profile, encoding="utf-8") as fh:
+                    profile = json.load(fh)
+            set_device_cap(ctrl, args.set_cap, cap_profile=profile,
+                           device_kind="e")
+            print(f"cap set to {args.set_cap!r} on {args.host}")
+            print("  Chloros re-pushes its own resolved cap when it next "
+                  "connects to this unit,")
+            print("  so set it there too if it has to survive.")
+            print()
+
         cal = DeviceCalibration.from_device(
             args.host, control=ctrl, require_profiles=args.require_profiles)
+        if args.save_profiles:
+            resp = ctrl.cmd({"cmd": "get_profiles"})
+            with open(args.save_profiles, "w", encoding="utf-8") as fh:
+                fh.write(resp.get("profiles_json", ""))
+            print(f"profiles written to {args.save_profiles}")
         if args.save_bundle:
             resp = ctrl.cmd({"cmd": "get_calibration"})
             with open(args.save_bundle, "w", encoding="utf-8") as fh:

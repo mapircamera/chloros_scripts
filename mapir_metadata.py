@@ -228,7 +228,22 @@ _ALS_META_DDL = """CREATE TABLE als_meta(
     calibration_completed_utc TEXT,
     cap_id TEXT,
     cap_applied INTEGER,
+    cap_id_source TEXT,
     utc_offset_minutes INTEGER)"""
+
+# Who decided ``cap_id``. The values are Chloros's (mip/daq_dls.py reads this
+# column and warns on the assumed ones), so do not invent new ones:
+#
+#   'operator'     the caller stated it (--cap-id). A human looked.
+#   'device'       read back from the unit's own profile store.
+#   'model'        forced by the hardware -- a DAQ-E-S has no removable cap.
+#   'auto_default' ASSUMED: nobody said, so the fleet default was used.
+#
+# The distinction is the whole point. A capped-vs-bare mistake is 20-30x in
+# downwelling and no downstream check can catch it, so a file has to be able
+# to say "this was a guess" -- that is what lets Chloros warn, and what lets
+# an operator override it later instead of trusting a number nobody verified.
+_CAP_ID_SOURCES = ("operator", "device", "model", "auto_default")
 
 # Full als_log schema (matches the MAPIR recorder). A DIY raw recorder only
 # fills event_type / precise_timestamp / spectral_data / is_saturated /
@@ -248,20 +263,31 @@ _VALID_KINDS = ("daq-u", "daq-m", "daq-e", "daq-e-s")
 # The cap correction Chloros will apply when a recording does not say
 # otherwise, per device model.
 #
-# MAPIR ships DAQ-U / DAQ-M / DAQ-E with the sunshine cosine corrector
-# PERMANENTLY INSTALLED for outdoor use, and the correction is large: mean
-# 30.6x on DAQ-U, 23.1x on DAQ-M, 11.0x on DAQ-E. A recording that declares
-# 'none' on a capped sensor is not "uncorrected", it is WRONG by that factor
-# (and on a DAQ-E worse still -- 'none' is an ACTIVE bare-geometry profile of
-# ~0.49x, so the round trip is ~22.6x). Chloros's own live recorder defaults
-# to sunshine_cosine for exactly this reason (backend_server.py
-# /api/daq/connect), so a raw recording made by these scripts has to declare
-# the same thing or the two paths disagree on identical hardware.
+# On DAQ-U / DAQ-M / DAQ-E the sunshine cosine corrector is REMOVABLE, and
+# nothing on the sensor can sense whether it is fitted. The default here is an
+# ASSUMPTION, chosen because it is how >90% of MAPIR users fly -- the same
+# assumption Chloros's own recorder makes (backend_server.py
+# /api/daq/connect), so a raw recording written here and one written by
+# Chloros describe identical hardware identically.
 #
-# A DAQ-E-S is the exception: its diffuser is fitted permanently and was on
-# the unit when its factory bundle was measured, so the correction is already
-# inside the gain and NO per-wavelength profile may apply on top. Chloros
-# resolves that model to 'as_recorded' and overrides any cap asked for.
+# The assumption is recorded as such: cap_id_source='auto_default' when it was
+# assumed, 'operator' when the caller stated it. That distinction is what
+# makes it UNDOABLE -- Chloros warns on an assumed cap and an operator can
+# override it per project, which is impossible if the file cannot say whether
+# anyone ever looked at the sensor. Never stamp 'operator' for a guess.
+#
+# Getting it wrong is large: mean 30.6x on DAQ-U, 23.1x on DAQ-M, 11.0x on
+# DAQ-E. A recording that declares 'none' on a capped sensor is not
+# "uncorrected", it is wrong by that factor -- and on a DAQ-E worse still,
+# because 'none' is an ACTIVE bare-geometry profile of ~0.49x rather than a
+# no-op, making the round trip ~22.6x.
+#
+# The DAQ-E-S is the one exception, and the only model whose diffuser is
+# genuinely permanent: it was on the unit when the factory bundle was
+# measured, so the correction is already inside the gain and NO per-wavelength
+# profile may apply on top. That is not an assumption, so it is stamped
+# 'model' -- Chloros resolves the same model to 'as_recorded' and overrides
+# any cap asked for.
 _DEFAULT_CAP_BY_KIND = {
     "daq-u": "sunshine_cosine",
     "daq-m": "sunshine_cosine",
@@ -320,6 +346,20 @@ class DaqWriter:
                           bare-geometry profile rather than a no-op).
                           ``'as_recorded'`` means "apply no per-wavelength
                           profile at all".
+    cap_id_source : str   WHO decided ``cap_id`` -- ``'operator'`` (a human
+                          stated it), ``'device'`` (read from the unit's
+                          profile store), ``'model'`` (the hardware settles
+                          it, i.e. DAQ-E-S), or ``'auto_default'`` (assumed,
+                          nobody said). Defaults to ``'operator'`` when
+                          ``cap_id`` is given and ``'auto_default'`` when it
+                          is not, which is almost always what you want.
+
+                          This is what makes an assumed cap UNDOABLE rather
+                          than merely wrong: Chloros warns on 'auto_default'
+                          and lets the operator override it per project. Never
+                          claim 'operator' for a guess -- that is the one
+                          value that tells a later reader not to re-examine
+                          it.
     tz_offset_minutes : int
                           Timezone provenance (als_meta v1.23): the UTC
                           offset, in signed minutes, of the NAIVE wall-clock
@@ -358,7 +398,8 @@ class DaqWriter:
     """
 
     def __init__(self, path, *, product_model, product_serial,
-                 device_name="", cap_id=None, tz_offset_minutes=0,
+                 device_name="", cap_id=None, cap_id_source=None,
+                 tz_offset_minutes=0,
                  calibration_applied=False, calibration_bundle_sha="",
                  calibration_completed_utc="", cap_applied=False):
         kind = str(product_model).strip().lower()
@@ -370,8 +411,22 @@ class DaqWriter:
         # Resolved here rather than defaulted to 'none' in the signature: a
         # bare declaration on a capped sensor is a 20-30x error that nothing
         # downstream can detect, and every unit MAPIR ships is capped.
+        # cap_id and its provenance resolve together: leaving cap_id to the
+        # default IS the assumption, so it can only ever be 'auto_default'
+        # (or 'model' where the hardware settles it). A caller that states a
+        # cap without saying where it came from is taken at its word --
+        # 'operator' -- because stating one is itself an act of declaring.
         if cap_id is None:
             cap_id = _DEFAULT_CAP_BY_KIND[kind]
+            if cap_id_source is None:
+                cap_id_source = "model" if kind == "daq-e-s" else "auto_default"
+        elif cap_id_source is None:
+            cap_id_source = "operator"
+        if cap_id_source not in _CAP_ID_SOURCES:
+            raise ValueError(
+                f"cap_id_source must be one of {_CAP_ID_SOURCES}, got "
+                f"{cap_id_source!r} -- these are the values Chloros reads; "
+                f"an unknown one makes the provenance unreadable.")
         # Readable back off the writer so a caller can PRINT what it is about
         # to declare. The cap is the one field an operator can get wrong from
         # the outside -- the sensor cannot sense what is screwed onto it -- so
@@ -415,14 +470,16 @@ class DaqWriter:
         cur.execute(
             "INSERT INTO als_meta (version, product_model, product_serial, "
             "device_name, calibration_applied, calibration_bundle_sha, "
-            "calibration_completed_utc, cap_id, cap_applied, "
+            "calibration_completed_utc, cap_id, cap_applied, cap_id_source, "
             "utc_offset_minutes) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            ("1.23", kind, str(product_serial).strip(), str(device_name),
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            # 1.25: cap_id_source. Matches the hub's schema number for the
+            # same column, so two files claiming one version have one shape.
+            ("1.25", kind, str(product_serial).strip(), str(device_name),
              int(bool(calibration_applied)),
              str(calibration_bundle_sha or ""),
              str(calibration_completed_utc or ""),
-             cap_id, int(bool(cap_applied)),
+             cap_id, int(bool(cap_applied)), cap_id_source,
              int(tz_offset_minutes)))
         self._conn.commit()
         self._count = 0

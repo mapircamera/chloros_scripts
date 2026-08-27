@@ -630,6 +630,14 @@ def main(argv=None):
     # nothing downstream can detect.
     cap_stamp = args.cap_id or (cal.cap_id if cal else None)
 
+    # ...and WHO decided it. None lets DaqWriter resolve 'auto_default' (or
+    # 'model' for a DAQ-E-S). This is what makes an assumed cap undoable
+    # rather than merely wrong: Chloros warns on 'auto_default' and an
+    # operator can override it per project, which it cannot do for a stamp
+    # that claims someone checked.
+    cap_source = ("operator" if args.cap_id
+                  else "device" if cal else None)
+
     # cap_applied describes what is IN the blobs, so it has to follow the cap
     # actually handed to cal.apply() below -- not merely whether the device
     # had profiles. `--cap-id as_recorded` tells apply() to skip every
@@ -647,6 +655,7 @@ def main(argv=None):
         out, product_model=product_model, product_serial=serial_id,
         device_name=args.device_name,
         cap_id=cap_stamp,
+        cap_id_source=cap_source,
         calibration_applied=baking,
         calibration_bundle_sha=(cal.bundle_sha if baking else ""),
         calibration_completed_utc=(cal.completed_utc if baking else ""),
@@ -677,10 +686,18 @@ def main(argv=None):
     # and getting it wrong is 20-30x in downwelling, which is silent because
     # nothing downstream can check it against anything.
     _stamped = writer.cap_id
-    _src = ("--cap-id" if args.cap_id else
+    _src = ("stated with --cap-id" if args.cap_id else
             "read from the device" if cal else
-            f"default for {product_model}")
+            f"ASSUMED -- the fleet default for {product_model}")
     print(f"  cap declared: {_stamped}  ({_src})")
+    if cap_source is None and product_model != "daq-e-s":
+        for _line in (
+                "    The sunshine corrector is REMOVABLE on this model and the",
+                "    sensor cannot tell whether it is fitted, so this is a",
+                "    guess -- recorded as one (cap_id_source=auto_default), so",
+                "    Chloros will flag it and you can override it later.",
+                "    Pass --cap-id to state what is actually on the sensor."):
+            print(_line)
     if _stamped == "none":
         for _line in (
                 "  ! 'none' declares the cap PHYSICALLY REMOVED. MAPIR ships",

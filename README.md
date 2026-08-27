@@ -374,13 +374,33 @@ a **bare** DAQ-E has a geometry correction (the bare diffuser over-reads
 directional light ~2×, while a sunshine cap is near-ideal). None of that is in
 the calibration bundle — it lives in Chloros and is versioned separately.
 
-**Every recording declares a cap, and the default is the cap the unit ships
-wearing.** MAPIR installs the sunshine cosine corrector permanently for outdoor
-use, so `record_daq.py` stamps `sunshine_cosine` for DAQ-U / DAQ-M / DAQ-E, and
-`as_recorded` for a DAQ-E-S (whose diffuser was on the unit when its factory
-bundle was measured — no profile may apply on top). That matches what Chloros's
-own recorder declares, so both paths agree on identical hardware. The cap is
-recorded as *provenance* — `cap_applied = 0` — and Chloros applies it at import.
+**Every recording declares a cap, and says who decided it.** On DAQ-U /
+DAQ-M / DAQ-E the sunshine corrector is **removable**, and nothing on the
+sensor can sense whether it is fitted — so somebody has to say. `record_daq.py`
+assumes `sunshine_cosine`, because that is how the large majority of units fly
+and it is the same assumption Chloros makes; a DAQ-E-S gets `as_recorded`
+instead, and that one is not an assumption (its diffuser is genuinely permanent
+and was on the unit when its factory bundle was measured, so no profile may
+apply on top).
+
+Crucially the file records **which of those it was**, in
+`als_meta.cap_id_source`:
+
+| value | meaning |
+|---|---|
+| `auto_default` | **assumed** — nobody said, the fleet default was used |
+| `operator` | you stated it with `--cap-id` |
+| `device` | read back from the unit's own profile store |
+| `model` | settled by the hardware (DAQ-E-S) |
+
+That distinction is what makes an assumed cap **undoable**. Chloros warns on
+`auto_default` — naming the file — and an operator can override the cap per
+project and get the corrected number back, because a raw recording has not had
+the cap multiplied in yet. A file that could not say whether anyone checked
+would leave a 20-30× error looking exactly like a verified one.
+
+The cap is recorded as *provenance* — `cap_applied = 0` — and Chloros applies
+it at import.
 
 Pass `--cap-id none` **only** for a sensor you have physically stripped.
 Declaring bare on a capped unit is not "uncorrected", it is wrong by the whole
@@ -395,10 +415,43 @@ correction, and nothing downstream can detect it:
 `record_daq.py` prints the cap it declared on every run, and warns when that is
 `none`.
 
-The **profile curves themselves** are not a device setting you can change from
-these scripts. They are resolved by Chloros for the unit and pushed into the
-device's profile store, where `daq_cal.py` reads them. `daq_cal.py <host>`
-prints which cap is aboard.
+#### Setting the cap on a DAQ-E
+
+A DAQ-E stores one resolved cap profile and folds it into the calibrated
+stream it publishes, so that store is what decides whether an offline consumer
+of that stream gets the truth. You can write it:
+
+```bash
+# see what the unit is currently applying
+python daq_cal.py 192.168.1.50
+
+# save the document it holds (the curve, verbatim)
+python daq_cal.py 192.168.1.50 --save-profiles aboard.json
+
+# apply NO per-wavelength profile at all -- needs no curve
+python daq_cal.py 192.168.1.50 --set-cap as_recorded
+
+# fit a different cap: supply that cap's curve, which Chloros ships
+python daq_cal.py 192.168.1.50 --set-cap fov_45        --cap-profile /path/to/chloros/daq/cap_profiles/e/fov_45.json
+```
+
+The curve has to come from somewhere — the device applies what it is given and
+carries no library to look one up in, so **every id except `as_recorded` needs
+its `--cap-profile` JSON**. Chloros ships them at
+`daq/cap_profiles/<kind>/<cap_id>.json`; copy the one you need. Asking for a
+real cap without its curve is refused rather than written as bare.
+
+Requires firmware **1.6.0+** (`set_profiles`). The document written is
+byte-identical to the one Chloros builds for the same cap, so setting a cap
+here does not make Chloros rewrite the unit's flash on its next connect.
+
+> **Chloros still has the last word.** It re-pushes its own resolved cap
+> whenever it connects and finds a different document. If the cap must survive,
+> set it in Chloros as well — this is for units that never meet a Chloros
+> install, or for checking what one is carrying.
+
+The **profile curves themselves** are authored in Chloros, not here. `daq_cal.py
+<host>` prints which cap is aboard.
 
 | Situation | Result |
 |-----------|--------|
@@ -450,8 +503,8 @@ number when a cap is fitted but no profile is aboard:
 python record_daq.py e --host 192.168.1.50 --calibrate csv --require-profiles
 ```
 
-None of this applies to a **DAQ-E-S**, whose diffuser is fitted permanently and
-was on the unit when its factory bundle was measured — the correction is
+None of this applies to a **DAQ-E-S** — the one model whose diffuser really is
+permanent. It was on the unit when its factory bundle was measured — the correction is
 already inside the gain. Chloros resolves that unit to `as_recorded` (no
 per-wavelength profile of any kind) and **overrides** any cap you ask for,
 because there is no cap choice to respect on optics that do not come off.

@@ -16,7 +16,9 @@ Two halves:
 Run:  python selftest.py
 """
 import contextlib
+import hashlib
 import io
+import json
 import math
 import os
 import shutil
@@ -146,7 +148,8 @@ def chloros_read_daq(path):  # verbatim shape: mip/daq_dls.py meta + als_log rea
         cols = {r[1] for r in conn.execute("PRAGMA table_info(als_meta)")}
         wanted = [c for c in ("version", "product_model", "product_serial",
                               "calibration_applied", "calibration_bundle_sha",
-                              "cap_id", "cap_applied", "utc_offset_minutes")
+                              "cap_id", "cap_applied", "cap_id_source",
+                              "utc_offset_minutes")
                   if c in cols]
         m = dict(zip(wanted, conn.execute(
             "SELECT %s FROM als_meta LIMIT 1" % ", ".join(wanted)).fetchone()))
@@ -164,6 +167,9 @@ def chloros_read_daq(path):  # verbatim shape: mip/daq_dls.py meta + als_log rea
             'calibration_bundle_sha': m.get('calibration_bundle_sha') or '',
             'cap_id': m.get('cap_id'),
             'cap_applied': m.get('cap_applied'),
+            # Absent on pre-v1.25 files, exactly as Chloros sees it: None
+            # there means "this file cannot say whether anyone checked".
+            'cap_id_source': m.get('cap_id_source'),
             'utc_offset_minutes': m.get('utc_offset_minutes')}, specs
 
 
@@ -227,7 +233,13 @@ def test_metadata_contract():
     check("daq product_model", meta['product_model'] == 'daq-u')
     check("daq serial (cal key)", meta['product_serial'] == 'AA-BB-CC-DD-EE')
     check("daq calibration_applied=0", meta['calibration_applied'] is False)
-    check("daq als_meta v1.23", meta['version'] == '1.23', meta['version'])
+    # v1.25 = the cap_id_source column. Pinned to the version whose SHAPE
+    # this file writes, not to a number for its own sake: two producers
+    # claiming one version with different als_meta columns is the trap the
+    # hub already walked into.
+    check("daq als_meta v1.25", meta['version'] == '1.25', meta['version'])
+    check("daq records WHO chose the cap",
+          meta['cap_id_source'] in mm._CAP_ID_SOURCES, meta['cap_id_source'])
     check("daq declares UTC stamps (utc_offset_minutes=0)",
           meta['utc_offset_minutes'] == 0, meta['utc_offset_minutes'])
     check("daq readings recovered", len(specs) == 15)
@@ -668,6 +680,34 @@ def test_cap_declaration():
     check("an explicit 'none' is still honoured (physically stripped unit)",
           cap == "none")
 
+    # The corrector is REMOVABLE on U/M/E and the sensor cannot sense it, so
+    # the default is a guess. It has to be recorded AS a guess -- that is what
+    # lets Chloros flag it and an operator override it later. A stamp claiming
+    # someone checked is the one thing that makes the mistake permanent.
+    _, meta = stamped("daq-u")
+    check("an assumed cap is recorded as assumed",
+          meta["cap_id_source"] == "auto_default", meta["cap_id_source"])
+    _, meta = stamped("daq-u", cap_id="sunshine_cosine")
+    check("a stated cap is recorded as operator-declared",
+          meta["cap_id_source"] == "operator", meta["cap_id_source"])
+    _, meta = stamped("daq-e", cap_id="fov_45", cap_id_source="device")
+    check("a cap read off the device is recorded as such",
+          meta["cap_id_source"] == "device", meta["cap_id_source"])
+    _, meta = stamped("daq-e-s")
+    check("a DAQ-E-S cap is model-forced, not assumed",
+          meta["cap_id_source"] == "model", meta["cap_id_source"])
+
+    def _bad_source():
+        try:
+            mm.DaqWriter(os.path.join(tmp, "cap_bad.daq"),
+                         product_model="daq-u", product_serial="SN",
+                         cap_id="none", cap_id_source="probably")
+            return False
+        except ValueError:
+            return True
+    check("an unknown cap_id_source is refused, not written", _bad_source(),
+          "Chloros reads these four values; a fifth is unreadable provenance")
+
     # A DAQ-E-S must be distinguishable in the file. Chloros maps both to
     # bundle kind 'e', but their cap treatment is opposite, so a recording
     # that calls a DAQ-E-S 'daq-e' cannot be processed correctly.
@@ -714,6 +754,14 @@ def test_cap_declaration():
             check(f"{kind} sunshine correction is large (>{floor:g}x)",
                   curve is not None and float(np.mean(curve)) > floor,
                   None if curve is None else "mean %.3gx" % float(np.mean(curve)))
+        # NOTE: whether Chloros PRINTS its assumed-cap warning is not
+        # asserted here. That warning lives inside the bundle-applying branch,
+        # so it only fires when a calibration bundle for the serial actually
+        # resolves -- which depends on the machine's cache and its network,
+        # not on anything this file writes. Asserting it here would pass or
+        # fail by environment. It is pinned on the Chloros side instead
+        # (tests/test_daq_cap_provenance_warning.py), where the bundle can be
+        # controlled.
     except ImportError as e:
         skip("live cap cross-check against mip.daq_dls", f"import failed: {e}")
     finally:
@@ -732,6 +780,107 @@ def _chloros_repo():
         cand = os.path.join(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))), "mapirlab")
     return cand if os.path.isfile(os.path.join(cand, "mip", "daq_dls.py"))         else None
+
+
+def test_set_device_cap():
+    """Writing the cap a DAQ-E applies to its own calibrated stream.
+
+    The device folds this into the W/m^2/nm it publishes, so it is the one
+    knob that decides whether an offline consumer of that stream gets the
+    truth. The document has to be byte-identical to what Chloros builds for
+    the same cap: its sha IS its identity, so a serialisation that differs
+    only cosmetically makes every Chloros connect rewrite flash.
+    """
+    print("\n-- set the cap on a DAQ-E (daq_cal --set-cap) --")
+    import daq_cal as dc
+
+    sent = {}
+
+    class _Ctrl:
+        def __init__(self, existing=None):
+            self._existing = existing
+
+        def cmd(self, obj):
+            if obj.get("cmd") == "get_profiles":
+                if self._existing is None:
+                    return {"ok": False, "error": "no document"}
+                return {"ok": True, "profiles_json": self._existing}
+            if obj.get("cmd") == "set_profiles":
+                sent.clear()
+                sent.update(obj)
+                return {"ok": True, "verified": True,
+                        "sha256": obj["sha256"]}
+            return {"ok": False}
+
+    dc.set_device_cap(_Ctrl(), "as_recorded", device_kind="e")
+    doc = json.loads(sent["profiles_json"])
+    check("as_recorded needs no curve and carries none",
+          doc["cap_id"] == "as_recorded" and doc["cap_profile"] is None)
+    check("the pushed sha is the sha OF the pushed bytes",
+          sent["sha256"] == hashlib.sha256(
+              sent["profiles_json"].encode("utf-8")).hexdigest())
+
+    def _refuses():
+        try:
+            dc.set_device_cap(_Ctrl(), "sunshine_cosine", device_kind="e")
+            return False
+        except dc.CalibrationError:
+            return True
+    check("a real cap without its curve is refused, not written as bare",
+          _refuses(),
+          "the device applies what it is given; there is no curve library "
+          "aboard to look one up in")
+
+    # Firmware that only echoes our sha back proves nothing about the write,
+    # so a read-back must catch a corrupt store.
+    class _Liar(_Ctrl):
+        def cmd(self, obj):
+            if obj.get("cmd") == "set_profiles":
+                return {"ok": True, "sha256": obj["sha256"]}   # no 'verified'
+            if obj.get("cmd") == "get_profiles":
+                return {"ok": True, "profiles_json": '{"not":"what we sent"}'}
+            return {"ok": False}
+
+    def _catches_corruption():
+        try:
+            dc.set_device_cap(_Liar(), "as_recorded", device_kind="e")
+            return False
+        except dc.CalibrationError as exc:
+            return "corrupt" in str(exc)
+    check("a read-back that does not match is reported as corruption",
+          _catches_corruption())
+
+    repo = _chloros_repo()
+    if repo is None:
+        skip("profiles document matches Chloros byte for byte",
+             "set CHLOROS_REPO to a mapirlab checkout")
+        return
+    saved = list(sys.path)
+    try:
+        sys.path.insert(0, repo)
+        from daq.device_sync import (build_profiles_document as _chl_build,
+                                     _canonical_json as _chl_json)
+        for cap in ("as_recorded", "none", "sunshine_cosine", "fov_45"):
+            theirs = _chl_build("daq-e", cap)
+            mine = dc.build_profiles_document(
+                "e", cap, cap_profile=theirs.get("cap_profile"),
+                dark_fraction=theirs.get("dark_fraction"))
+            check(f"profiles document for {cap!r} is byte-identical to "
+                  f"Chloros's", _chl_json(theirs) == dc._canonical_json(mine))
+        # And the dark_fraction the scripts cannot compute is carried over
+        # from whatever the unit already holds, so setting a cap here does
+        # not make Chloros rewrite flash on its next connect.
+        existing = _chl_json(_chl_build("daq-e", "sunshine_cosine"))
+        dc.set_device_cap(_Ctrl(existing), "fov_45",
+                          cap_profile=_chl_build("daq-e", "fov_45")["cap_profile"],
+                          device_kind="e")
+        check("the unit's dark_fraction is carried forward, not dropped",
+              sent["profiles_json"] == _chl_json(_chl_build("daq-e", "fov_45")))
+    except ImportError as e:
+        skip("profiles document matches Chloros byte for byte",
+             f"import failed: {e}")
+    finally:
+        sys.path[:] = saved
 
 
 def test_export_round_trip():
@@ -1092,6 +1241,7 @@ def main():
     test_camera_capture_flow()
     test_offline_calibration()
     test_cap_declaration()
+    test_set_device_cap()
     test_export_round_trip()
     test_multicast_stream()
     n = sum(RESULTS)
