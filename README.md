@@ -13,6 +13,11 @@ coding) for DIY drone and research setups.
 > They stamp each file with the device's **serial number and model**, and on
 > import Chloros fetches that exact device's factory calibration from the cloud
 > and applies it. Capture is yours; the science is handled at import.
+>
+> And Chloros **hands the result back**: every `.daq` you import is written out
+> again, calibrated, as a `.daq` *and* a `.csv` of spectral irradiance — see
+> [Light sensor only](#light-sensor-only--getting-a-calibrated-csv-out-of-chloros).
+> That works for **DAQ-U, DAQ-M and DAQ-E alike**, and needs no camera.
 
 ## What's here
 
@@ -144,6 +149,80 @@ Common options:
 Press **Ctrl-C** to stop. The script records continuously; mount the sensor
 upward-facing (downwelling) and run it for the whole flight.
 
+## Light sensor only — getting a calibrated `.csv` out of Chloros
+
+Plenty of setups are **just a light sensor**: no camera, no imagery, no
+reflectance — you want spectral irradiance, PPFD or lux over time, calibrated.
+That is a first-class workflow, and a project with no images in it is a valid
+project. Capture raw in the field, then let Chloros calibrate:
+
+```bash
+python record_daq.py u --port COM7 --duration 3600
+```
+
+Then take the `.daq` files to any one of:
+
+- **Desktop app** — make a project, drag the `.daq` files in, press **Process**.
+  Nothing camera-specific to configure.
+- **CLI** — `chloros-cli process ./my_daq_files -o ./my_project`
+- **SDK** — see below.
+
+Chloros fetches each sensor's factory calibration **by serial** (local cache
+first, then the MAPIR cloud), applies it, and writes two products per recording
+into a `Light Sensor` folder inside the project:
+
+```
+<project>/
+└── Light Sensor/
+    ├── u_20260826_143012_calibrated.daq   # reprocessable archive
+    └── u_20260826_143012_calibrated.csv   # W/m²/nm + photometrics
+```
+
+The `.csv` is one row per reading:
+
+| Columns | |
+|---|---|
+| `timestamp_utc`, `timestamp_ns` | absolute UTC epoch of the reading |
+| `integration_time_ms`, `calibrated` | acquisition + per-frame calibration flag |
+| `total_power_W_m2` | integrated irradiance |
+| `photopic_lux`, `scotopic_lux` | photometric illuminance |
+| `ppfd_umol_m2_s`, `ppfd_blue`, `ppfd_green`, `ppfd_red` | PAR photon flux, total and split |
+| `peak_wavelength_nm` | spectral peak |
+| `340.0` … `1010.0` | the full spectrum, W/m²/nm, 135 points at 5 nm |
+
+The `.daq` beside it is the same SQLite format these scripts write, now carrying
+calibrated spectra and declaring the bundle that produced them — so re-importing
+it does **not** calibrate it a second time.
+
+From the SDK:
+
+```python
+import chloros_sdk
+
+with chloros_sdk.ChlorosLocal() as cl:
+    cl.create_project("DAQ-U_2026-08-26")
+    cl.import_images("./my_daq_files")     # .daq files; no imagery needed
+    result = cl.export_light_sensor()
+
+for rec in result["exported"]:
+    print(rec["csv"])
+for rec in result["skipped"]:
+    print("skipped", rec["source"], "--", rec["reason"])
+```
+
+> The **CLI and SDK need a paid Chloros+ plan** (enforced server-side). The
+> desktop app route does not — it works on the free tier.
+
+> **A recording whose calibration can't be fetched is skipped, not faked.** If
+> you are offline, or that serial has no calibration on file, Chloros reports
+> the recording under `skipped` **with the reason** and writes nothing for it —
+> rather than emitting a file named `*_calibrated.csv` that holds raw counts.
+> Reconnect, re-run, and it completes.
+
+Your original raw `.daq` is never modified; the products are written alongside
+it. Keep the raw one — it is the master, and stays re-calibratable against a
+future coefficient revision.
+
 ## DAQ-E data channels — what exists, and what these scripts use
 
 A DAQ-E on firmware **1.7.0+** emits two spectral streams on separate multicast
@@ -207,6 +286,12 @@ pulls it down over ethernet and applies it locally, so you get spectral
 irradiance in **W/m²/nm** without an account, an internet connection, or a
 Chloros install.
 
+> This is the **air-gapped** route, and it is DAQ-E only — the bundle has to be
+> on the device. If you have Chloros, you do not need it: importing a raw `.daq`
+> produces the same calibrated `.csv` for **any** DAQ model, including DAQ-U and
+> DAQ-M, which have no onboard bundle to read. See
+> [Light sensor only](#light-sensor-only--getting-a-calibrated-csv-out-of-chloros).
+
 ```bash
 # .daq stays RAW; calibrated irradiance goes to a sibling .csv
 python record_daq.py e --host 192.168.1.50 --calibrate csv
@@ -217,13 +302,19 @@ python daq_cal.py 192.168.1.50
 
 | `--calibrate` | `.daq` contents | When to use |
 |---------------|-----------------|-------------|
-| `off` (default) | raw counts | Chloros will calibrate at import |
-| `csv` | raw counts, **plus** a calibrated `.csv` | **Recommended.** Usable numbers now, and the `.daq` stays reprocessable |
+| `off` (default) | raw counts | **Recommended.** Chloros calibrates at import and writes the `.csv` for you |
+| `csv` | raw counts, **plus** a calibrated `.csv` | you need numbers in the field, with no Chloros and no internet |
 | `bake` | calibrated W/m²/nm, stamped with the bundle SHA | the recording must stand completely alone |
 
-Prefer `csv` over `bake`. A raw `.daq` can be re-calibrated later if a
-coefficient revision lands; a baked one is frozen at whatever the bundle said
-the day you recorded.
+Prefer a raw `.daq` over `bake` in every case where you have a choice. A raw
+recording can be re-calibrated later if a coefficient revision lands; a baked
+one is frozen at whatever the bundle said the day you recorded, and no amount
+of reprocessing gets that back.
+
+`csv` and `bake` both still import fine. Chloros reads a baked recording as-is
+rather than calibrating it twice, and re-exports it into `Light Sensor/`
+alongside everything else — so a baked file loses the ability to be
+*re-calibrated*, not the ability to be *used*.
 
 ### Caps
 
@@ -283,6 +374,12 @@ between 1 and 500 ms and the dark model is a function of it.
   recording to imagery **by timestamp**. Record a DAQ during the flight and keep
   the host clock reasonably accurate (the scripts stamp absolute UTC time). With
   no DAQ you still get radiance, not reflectance.
+- **You get the calibration back, not just its effect.** Importing a `.daq`
+  writes `<project>/Light Sensor/<name>_calibrated.daq` and `.csv` — the
+  calibrated spectra as a file, rather than only as an intermediate on the way
+  to reflectance. No camera required; a light-sensor-only project is a valid
+  project. See
+  [Light sensor only](#light-sensor-only--getting-a-calibrated-csv-out-of-chloros).
 - **Timezone is declared, not guessed.** Naive wall-clock stamps are ambiguous,
   so the TIFFs carry EXIF `OffsetTimeOriginal = +00:00` and the `.daq` carries
   `als_meta.utc_offset_minutes = 0` (schema v1.23) — the scripts stamp UTC
@@ -295,7 +392,13 @@ between 1 and 500 ms and the dark model is a function of it.
   calibration); `calibration_applied = 0` tells Chloros to calibrate on import.
   The one exception is `--calibrate bake`, which sets `calibration_applied = 1`
   and carries the bundle SHA — Chloros then imports those spectra as-is instead
-  of calibrating them a second time.
+  of calibrating them a second time. That flag is the *only* thing standing
+  between a calibrated file and being calibrated twice, so if you adapt
+  `mapir_metadata.py` to write your own calibrated recordings, set it — and set
+  `calibration_bundle_sha` with it, which `DaqWriter` enforces.
+- **Your raw file is never modified.** Chloros writes derived products
+  alongside it and leaves the recording alone, so the raw `.daq` remains the
+  master copy. Archive that one.
 
 ## Notes
 
