@@ -71,6 +71,32 @@ FLAG_CALIBRATED = 0x08
 # good spectrum -- which also means a reader must tolerate the extra bytes.
 FLAG_IMU = 0x10
 IMU_TRAILER_LEN = 22
+IMU_TRAILER_VERSION = 0x01
+
+# Standalone attitude stream (firmware >= 1.12) -- its own group, its own
+# rate. The trailer above rides on spectral datagrams, so attitude was only
+# ever delivered at the SPECTRAL rate (~2.5 Hz) while the accelerometer
+# sampled at 50 Hz and 19 of every 20 samples were thrown away. This is
+# those samples.
+DEFAULT_IMU_GROUP = "239.10.10.12"
+DEFAULT_IMU_PORT = 5004
+IMU_DGRAM_VERSION = 0x03
+IMU_DGRAM_LEN = 58
+
+# imu_flags bits (firmware main.cpp)
+IMU_TF_FRESH = 0x01
+IMU_TF_ANGLES_VALID = 0x02
+IMU_TF_CAL_APPLIED = 0x04
+IMU_TF_HEALTHY = 0x08
+IMU_TF_TEMP_VALID = 0x10
+IMU_TF_TARE_SET = 0x20
+IMU_TF_TARE_EXCEEDED = 0x40
+IMU_TF_TEMPCO_APPLIED = 0x80
+
+# "the firmware wrote nothing meaningful here"
+CDEG_U16_INVALID = 0xFFFF
+CDEG_I16_INVALID = 0x7FFF
+TEMP_I16_INVALID = -0x8000
 
 
 def _crc16_ccitt(data: bytes) -> int:
@@ -80,6 +106,135 @@ def _crc16_ccitt(data: bytes) -> int:
         for _ in range(8):
             crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
     return crc
+
+
+def parse_imu_trailer(data):
+    """Decode the 22-byte IMU trailer, or None if absent/corrupt.
+
+    ``data`` is the trailer alone. A garbled one degrades to "no IMU on this
+    frame" rather than poisoning a tilt record -- which is the whole reason it
+    rides outside the spectral crc.
+
+    ``x/y/z_mg`` are the DIFFUSER frame when ``cal_applied`` is set and the raw
+    board frame otherwise: the firmware bias-subtracts, scales and rotates
+    before filling the trailer. Do not assume the axes mean the same thing on
+    every unit.
+
+    Field for field the same decode as Chloros's
+    ``daq/sensors/e.py:parse_imu_trailer``; selftest cross-checks the two
+    against each other, because two decoders of one wire format that disagree
+    are worse than one decoder.
+    """
+    if len(data) < IMU_TRAILER_LEN or data[0] != IMU_TRAILER_VERSION:
+        return None
+    if struct.unpack_from("<H", data, 20)[0] != _crc16_ccitt(data[:20]):
+        return None
+    fl = data[1]
+    tilt = struct.unpack_from("<H", data, 10)[0]
+    roll = struct.unpack_from("<h", data, 12)[0]
+    pitch = struct.unpack_from("<h", data, 14)[0]
+    return {
+        "trailer_version": data[0],
+        "flags": fl,
+        "fresh": bool(fl & IMU_TF_FRESH),
+        "angles_valid": bool(fl & IMU_TF_ANGLES_VALID),
+        "cal_applied": bool(fl & IMU_TF_CAL_APPLIED),
+        "healthy": bool(fl & IMU_TF_HEALTHY),
+        "temp_valid": bool(fl & IMU_TF_TEMP_VALID),
+        "tempco_applied": bool(fl & IMU_TF_TEMPCO_APPLIED),
+        "tare_set": bool(fl & IMU_TF_TARE_SET),
+        "tare_exceeded": bool(fl & IMU_TF_TARE_EXCEEDED),
+        "sample_age_ms": struct.unpack_from("<H", data, 2)[0],
+        "x_mg": struct.unpack_from("<h", data, 4)[0],
+        "y_mg": struct.unpack_from("<h", data, 6)[0],
+        "z_mg": struct.unpack_from("<h", data, 8)[0],
+        "tilt_deg": None if tilt == CDEG_U16_INVALID else tilt / 100.0,
+        "roll_deg": None if roll == CDEG_I16_INVALID else roll / 100.0,
+        "pitch_deg": None if pitch == CDEG_I16_INVALID else pitch / 100.0,
+        "mag_mg": struct.unpack_from("<H", data, 16)[0],
+        # int8, uncalibrated die-temp TREND. The part specifies 1 LSB/degC of
+        # CHANGE with no absolute reference, so only differences mean
+        # anything -- never present this as a thermometer reading.
+        "temp_raw": (struct.unpack_from("<b", data, 18)[0]
+                     if fl & IMU_TF_TEMP_VALID else None),
+    }
+
+
+def parse_imu_datagram(data):
+    """Decode a v3 attitude datagram from the standalone IMU group.
+
+    Shaped as a SUPERSET of :func:`parse_imu_trailer` -- same key names, same
+    units, same None-for-undefined convention -- so a consumer that handles a
+    trailer handles one of these unchanged. The extra keys are the ones the
+    trailer has no room for: ``raw_x/y/z_mg`` and ``tare_angle_deg``.
+
+    Length is an EXACT match, unlike the spectral parser's lower bound: this
+    datagram has no payload_len and nothing is appended after its crc, so
+    anything longer is not one. If that ever changes the crc offset has to
+    come from a length field -- do not simply relax the comparison.
+
+    NOTE the timestamp keys are ``timestamp_us`` / ``absolute_time``, matching
+    :func:`parse_datagram` in this module rather than Chloros's ``ts_us`` /
+    ``absolute_ts``. Everything else is name-for-name identical (selftest
+    cross-checks it); the trailer carries no timestamp at all, so these two
+    names had no prior art to follow and the local convention won.
+    """
+    if len(data) != IMU_DGRAM_LEN or data[0:2] != MAGIC:
+        return None
+    if data[2] != IMU_DGRAM_VERSION:
+        return None
+    if struct.unpack_from("<H", data, 56)[0] != _crc16_ccitt(data[:56]):
+        return None
+
+    flags = data[3]
+    fl = data[28]
+    angles_ok = bool(fl & IMU_TF_ANGLES_VALID)
+    tilt_c, roll_c, pitch_c, mag, tare_c = struct.unpack_from("<HhhHH", data, 44)
+    temp = struct.unpack_from("<h", data, 54)[0]
+    raw = struct.unpack_from("<hhh", data, 32)
+    cor = struct.unpack_from("<hhh", data, 38)
+    serial = "-".join("%02X" % b for b in data[22:27])
+    return {
+        # Its own version namespace: v3 is the attitude datagram, not a
+        # newer spectral one. Carried so the shared per-device bookkeeping
+        # (DeviceState.update) reads one shape whichever stream it is fed.
+        "version": IMU_DGRAM_VERSION,
+        "seq": struct.unpack_from("<I", data, 4)[0],
+        "timestamp_us": struct.unpack_from("<Q", data, 8)[0],
+        "absolute_time": bool(flags & FLAG_ABS_TS),
+        "ptp_synced": bool(flags & FLAG_PTP),
+        "mac": ":".join("%02x" % b for b in data[16:22]),
+        "sensor_serial": serial,
+        "model": "daq-e-s" if data[27] == 1 else "daq-e",
+        "trailer_version": IMU_TRAILER_VERSION,
+        "flags": fl,
+        "fresh": bool(fl & IMU_TF_FRESH),
+        "angles_valid": angles_ok,
+        "cal_applied": bool(fl & IMU_TF_CAL_APPLIED),
+        "healthy": bool(fl & IMU_TF_HEALTHY),
+        "temp_valid": bool(fl & IMU_TF_TEMP_VALID),
+        "tempco_applied": bool(fl & IMU_TF_TEMPCO_APPLIED),
+        "tare_set": bool(fl & IMU_TF_TARE_SET),
+        "tare_exceeded": bool(fl & IMU_TF_TARE_EXCEEDED),
+        "sample_age_ms": struct.unpack_from("<H", data, 30)[0],
+        "x_mg": cor[0], "y_mg": cor[1], "z_mg": cor[2],
+        # Gated on the flag AND the sentinel. The flag is the firmware's
+        # verdict, the sentinel is what it actually wrote; trusting one
+        # without the other is how 655.35 degrees ends up in an average.
+        "tilt_deg": (tilt_c / 100.0
+                     if angles_ok and tilt_c != CDEG_U16_INVALID else None),
+        "roll_deg": (roll_c / 100.0
+                     if angles_ok and roll_c != CDEG_I16_INVALID else None),
+        "pitch_deg": (pitch_c / 100.0
+                      if angles_ok and pitch_c != CDEG_I16_INVALID else None),
+        "mag_mg": mag,
+        "temp_raw": (temp if (fl & IMU_TF_TEMP_VALID)
+                     and temp != TEMP_I16_INVALID else None),
+        "raw_x_mg": raw[0], "raw_y_mg": raw[1], "raw_z_mg": raw[2],
+        "tare_angle_deg": (tare_c / 100.0
+                           if tare_c != CDEG_U16_INVALID else None),
+        "device_key": serial,
+    }
 
 
 def parse_datagram(data: bytes, src_ip: str = "") -> Optional[dict]:
@@ -133,8 +288,11 @@ def parse_datagram(data: bytes, src_ip: str = "") -> Optional[dict]:
     # the decode to Chloros. Layout in PROTOCOL.md. A TRUNCATED trailer reads
     # as absent rather than invalidating the frame: it sits outside the crc
     # exactly so a bad one cannot cost a good spectrum.
-    has_imu = (bool(flags & FLAG_IMU)
-               and len(data) >= hdr + plen + 2 + IMU_TRAILER_LEN)
+    imu = None
+    if flags & FLAG_IMU and len(data) >= hdr + plen + 2 + IMU_TRAILER_LEN:
+        _start = hdr + plen + 2
+        imu = parse_imu_trailer(data[_start:_start + IMU_TRAILER_LEN])
+    has_imu = imu is not None
 
     spectrum = None
     if calibrated:
@@ -155,6 +313,7 @@ def parse_datagram(data: bytes, src_ip: str = "") -> Optional[dict]:
         "saturated": bool(flags & FLAG_SATURATED),
         "calibrated": calibrated,
         "has_imu": has_imu,
+        "imu": imu,
         "mac": mac,
         "sensor_serial": serial,
         "model": model,
@@ -233,6 +392,72 @@ class DeviceState:
         return " ".join(bits)
 
 
+# Attitude CSV columns, in order. Same names the parsers emit, so a reader of
+# one is a reader of the other.
+_IMU_CSV_COLUMNS = (
+    "sensor_serial", "model", "seq", "timestamp_us", "ptp_synced",
+    "sample_age_ms", "fresh", "healthy", "angles_valid", "cal_applied",
+    "tempco_applied", "tare_set", "tare_exceeded",
+    "tilt_deg", "roll_deg", "pitch_deg", "tare_angle_deg",
+    "x_mg", "y_mg", "z_mg", "mag_mg",
+    "raw_x_mg", "raw_y_mg", "raw_z_mg", "temp_raw",
+)
+
+
+def _csv_cell(v):
+    """Empty for undefined, never 0.
+
+    An angle the firmware did not compute is NOT level, and writing 0.0 for it
+    puts a fabricated horizontal into any average taken over the column.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return int(v)
+    return v
+
+
+def _open_daq(args, frame):
+    """Open the .daq once the first frame has told us what to declare.
+
+    The stream's OWN calibrated flag decides ``calibration_applied`` -- not
+    which group was joined. That flag is the only thing standing between a
+    calibrated recording and being calibrated a second time at import, which
+    would square the correction silently, so it is taken from the data rather
+    than from an argument.
+    """
+    from mapir_metadata import DaqWriter
+
+    calibrated = bool(frame["calibrated"])
+    model = args.serial_model or frame.get("model") or "daq-e"
+    serial = frame.get("sensor_serial")
+    if not serial:
+        print("! --daq needs the sensor serial, which v1 frames do not carry "
+              "(firmware < 1.7.0). Nothing recorded; update the unit or use "
+              "record_daq.py over the raw TCP channel.",
+              file=sys.stderr, flush=True)
+        return None, None
+    kwargs = {}
+    if calibrated:
+        # The device folded in its own bundle. We do not have that bundle's
+        # sha from the wire -- the datagram carries no provenance -- so say
+        # so explicitly rather than inventing one. DaqWriter demands a sha
+        # for a calibrated recording precisely so this cannot pass silently.
+        kwargs = dict(
+            calibration_applied=True,
+            calibration_bundle_sha="device:" + (serial or "unknown"),
+            calibration_completed_utc="",
+            cap_id=args.cap_id,
+            cap_id_source="device",
+            cap_applied=(args.cap_id not in (None, "", "as_recorded")),
+        )
+    w = DaqWriter(args.daq, product_model=model, product_serial=serial,
+                  device_name=frame.get("mac") or "", **kwargs)
+    print(f"  recording {'CALIBRATED' if calibrated else 'RAW'} frames to "
+          f"{args.daq}", flush=True)
+    return w, args.daq
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="Listen to any number of DAQ-E / DAQ-E-S sensors over "
@@ -249,6 +474,27 @@ def main(argv=None):
     p.add_argument("--serial", action="append", default=[],
                    help="only show this sensor serial; repeatable")
     p.add_argument("--csv", help="append every frame to this CSV")
+    p.add_argument("--daq", metavar="PATH",
+                   help="also record to a Chloros-compatible .daq. The file "
+                        "declares what the stream actually carried: a "
+                        "calibrated stream is stamped calibration_applied=1 "
+                        "so Chloros imports it as-is instead of calibrating "
+                        "it a second time.")
+    p.add_argument("--imu", action="store_true",
+                   help="listen to the standalone attitude stream "
+                        "(239.10.10.12:5004, firmware 1.12+) instead of "
+                        "spectra -- full accelerometer rate rather than the "
+                        "~2.5 Hz the spectral trailer delivers. CSV only.")
+    p.add_argument("--serial-model", metavar="MODEL",
+                   help="with --daq: override the product_model "
+                        "stamped (daq-e / daq-e-s). Default: whatever "
+                        "the frames report, which v2 always does.")
+    p.add_argument("--cap-id", metavar="CAP_ID", default="as_recorded",
+                   help="with --daq on a CALIBRATED stream: which cap the "
+                        "device folded in, for the file to declare. Read it "
+                        "off the unit with daq_cal.py. Default "
+                        "'as_recorded' -- the device applied whatever it "
+                        "holds and this script is not guessing which.")
     p.add_argument("--count", type=int, default=0, help="stop after N frames")
     p.add_argument("--duration", type=float, default=0.0,
                    help="stop after N seconds")
@@ -256,14 +502,28 @@ def main(argv=None):
                    help="suppress per-frame lines; print the summary only")
     args = p.parse_args(argv)
 
-    group = args.group or (DEFAULT_CAL_GROUP if args.calibrated
+    if args.imu and args.daq:
+        raise SystemExit(
+            "--imu cannot be written to a .daq: an attitude sample is not a "
+            "spectrum, and Chloros only reads als_log rows that HAVE "
+            "spectral_data. Record attitude to --csv, or record spectra with "
+            "--daq -- a DAQ-E-S folds its attitude into those frames as a "
+            "trailer, and that DOES land in the .daq's imu_* columns.")
+    if args.imu and args.calibrated:
+        raise SystemExit("--imu and --calibrated are different streams; "
+                         "pick one.")
+
+    group = args.group or (DEFAULT_IMU_GROUP if args.imu else
+                           DEFAULT_CAL_GROUP if args.calibrated
                            else DEFAULT_RAW_GROUP)
-    port = args.port or (DEFAULT_CAL_PORT if args.calibrated
+    port = args.port or (DEFAULT_IMU_PORT if args.imu else
+                         DEFAULT_CAL_PORT if args.calibrated
                          else DEFAULT_RAW_PORT)
     wanted = {s.strip().upper() for s in args.serial}
 
     sock = open_multicast(group, port, args.iface)
-    kind = "CALIBRATED (W/m^2/nm)" if args.calibrated else "RAW counts"
+    kind = ("ATTITUDE (deg / mg)" if args.imu else
+            "CALIBRATED (W/m^2/nm)" if args.calibrated else "RAW counts")
     print(f"Listening on {group}:{port} -- {kind}")
     if wanted:
         print(f"  filtering to: {', '.join(sorted(wanted))}")
@@ -281,11 +541,20 @@ def main(argv=None):
         # inspection. The per-row `calibrated` column below is the
         # authoritative one (it is the frame's own flag, not this argument),
         # but a reader opening the file wants to know at the top.
-        _units = "calibrated W/m^2/nm" if args.calibrated else "raw counts"
+        _units = ("attitude (deg / mg)" if args.imu else
+                  "calibrated W/m^2/nm" if args.calibrated else "raw counts")
         csv_out.writerow([f"# MAPIR DAQ-E multicast {group}:{port} -- {_units}"])
-        csv_out.writerow(["device", "serial", "model", "seq", "timestamp_us",
-                          "ptp", "integration_ms", "saturated", "calibrated",
-                          "units", "imu", "n_points", "spectrum..."])
+        if args.imu:
+            csv_out.writerow(_IMU_CSV_COLUMNS)
+        else:
+            csv_out.writerow(["device", "serial", "model", "seq",
+                              "timestamp_us", "ptp", "integration_ms",
+                              "saturated", "calibrated", "units", "imu",
+                              "tilt_deg", "roll_deg", "pitch_deg",
+                              "n_points", "spectrum..."])
+
+    daq_writer = None
+    daq_path = None
 
     n = 0
     t0 = time.monotonic()
@@ -299,10 +568,13 @@ def main(argv=None):
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
                 continue
-            f = parse_datagram(data, addr[0])
+            f = (parse_imu_datagram(data) if args.imu
+                 else parse_datagram(data, addr[0]))
             if f is None:
                 bad += 1
                 continue
+            if args.imu:
+                f.setdefault("src_ip", addr[0])
             if wanted and (f["sensor_serial"] or "").upper() not in wanted:
                 continue
 
@@ -315,7 +587,8 @@ def main(argv=None):
             # frame outright (daq/sensors/e.py); this script keeps it, because
             # the per-row `calibrated` column records what actually arrived
             # rather than what the group implies.
-            if f["calibrated"] != args.calibrated and not mislabelled_warned:
+            if (not args.imu and f["calibrated"] != args.calibrated
+                    and not mislabelled_warned):
                 mislabelled_warned = True
                 want = "calibrated" if args.calibrated else "raw"
                 got = "calibrated" if f["calibrated"] else "raw"
@@ -331,7 +604,7 @@ def main(argv=None):
             if st is None:
                 st = devices[key] = DeviceState(key)
                 note = ""
-                if f["version"] == V1:
+                if f["version"] == V1 and not args.imu:
                     note = ("  [legacy v1: no identity in the frame, keyed on "
                             "source IP. Update to fw 1.7.0+ for reliable "
                             "multi-sensor separation.]")
@@ -339,7 +612,10 @@ def main(argv=None):
                       flush=True)
             st.update(f)
 
-            if csv_out is not None and f["spectrum"] is not None:
+            if csv_out is not None and args.imu:
+                csv_out.writerow([_csv_cell(f.get(c)) for c in _IMU_CSV_COLUMNS])
+            elif csv_out is not None and f["spectrum"] is not None:
+                _imu = f.get("imu") or {}
                 csv_out.writerow(
                     [key, f["sensor_serial"] or "", f["model"] or "",
                      f["seq"], f["timestamp_us"], int(f["ptp_synced"]),
@@ -351,8 +627,37 @@ def main(argv=None):
                      int(f["calibrated"]),
                      "W/m^2/nm" if f["calibrated"] else "counts",
                      int(f["has_imu"]),
+                     _csv_cell(_imu.get("tilt_deg")),
+                     _csv_cell(_imu.get("roll_deg")),
+                     _csv_cell(_imu.get("pitch_deg")),
                      len(f["spectrum"])]
                     + ["%.6g" % v for v in f["spectrum"]])
+
+            # --- .daq ---------------------------------------------------
+            # Opened on the FIRST frame, not up front: the model and serial
+            # it has to declare come off the wire, and a v1 unit reports
+            # neither. Opening early would mean inventing them.
+            if args.daq and f["spectrum"] is not None:
+                if daq_writer is None:
+                    daq_writer, daq_path = _open_daq(args, f)
+                if daq_writer is not None:
+                    daq_writer.write(
+                        f["spectrum"], f["saturated"],
+                        f["integration_time_ms"] or 0,
+                        # The sensor latches timestamp_us as its own last
+                        # byte arrives, so it beats host arrival time -- but
+                        # only when it is an absolute epoch. A free-running
+                        # boot counter would look absolute and drag the file
+                        # onto a nonsense axis, so hand it over only when the
+                        # frame says it is real and let DaqWriter refuse the
+                        # rest.
+                        timestamp_ns=(f["timestamp_us"] * 1000
+                                      if f["absolute_time"]
+                                      else time.time_ns()),
+                        device_timestamp_ns=(f["timestamp_us"] * 1000
+                                             if f["absolute_time"] else None),
+                        device_ts_ptp=f["ptp_synced"],
+                        imu=f.get("imu"))
 
             if not args.quiet and st.frames % 20 == 1:
                 peak = max(f["spectrum"]) if f["spectrum"] else float("nan")
@@ -369,6 +674,8 @@ def main(argv=None):
         sock.close()
         if csv_fh is not None:
             csv_fh.close()
+        if daq_writer is not None:
+            daq_writer.close()
 
     print(f"\n{len(devices)} sensor(s), {n} frame(s)"
           + (f", {bad} malformed datagram(s)" if bad else ""))
@@ -379,6 +686,11 @@ def main(argv=None):
               f"dropped={st.dropped} ({loss:.2f}%)")
     if args.csv:
         print(f"\nCSV: {args.csv}")
+    if daq_path:
+        print(f"DAQ: {daq_path}  ({daq_writer.record_count} reading(s), "
+              f"cap={daq_writer.cap_id})")
+    elif args.daq:
+        print("DAQ: nothing written -- no spectral frames arrived.")
     return 0
 
 

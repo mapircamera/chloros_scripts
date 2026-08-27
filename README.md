@@ -243,15 +243,29 @@ revised bundle. Prefer it for anything you intend to keep.
 
 Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
 
-**What you can record, and to what.** The `.daq` format Chloros ingests holds
-one thing: the sensor's spectra. `record_daq.py` writes it from the **raw**
-channel — that is the reprocessable master, and the only stream that becomes a
-`.daq`. The calibrated stream and the IMU stream are read-only here:
-`daq_stream.py` will log the calibrated stream to CSV, and nothing in this
-repo records the IMU stream at all (Chloros does). So "which stream do I
-record?" has one answer for a `.daq` — raw — and the calibrated numbers come
-either from `--calibrate` (locally, DAQ-E) or from Chloros at import (any
-model).
+**What you can record, and to what.**
+
+| Stream | `.daq` | `.csv` | How |
+|---|:---:|:---:|---|
+| Raw spectra | ✅ | ✅ | `record_daq.py <k> --csv` (any model) or `daq_stream.py --daq --csv` (DAQ-E) |
+| Calibrated spectra | ✅ | ✅ | `daq_stream.py --calibrated --daq --csv`, or `record_daq.py e --calibrate bake`/`csv` |
+| Attitude (IMU) | trailer only | ✅ | `daq_stream.py --imu --csv`; the per-frame trailer lands in the `.daq`'s `imu_*` columns automatically |
+
+A calibrated recording is **stamped as calibrated** (`calibration_applied = 1`)
+from the frame's own flag bit, not from which group you joined — so Chloros
+imports it as-is instead of applying its bundle a second time.
+
+The standalone attitude stream is CSV-only, and asking for `--daq` there is
+refused with the reason: Chloros reads `als_log` rows that have
+`spectral_data`, and an attitude sample is not a spectrum. That is not a gap —
+attitude that needs to travel *with* an irradiance reading already does, as the
+per-frame trailer, and that lands in the `.daq` beside the spectrum it
+qualifies. The standalone stream exists for full-rate attitude (the trailer
+only delivers at the ~2.5 Hz spectra arrive at, while the accelerometer samples
+at 50 Hz).
+
+Raw remains the reprocessable master either way: a coefficient revision reaches
+every raw recording you kept and none of the device-calibrated ones.
 
 **The IMU trailer.** On firmware **1.8.0+** — which is every DAQ-E-S — a
 spectral frame can carry a 22-byte attitude trailer appended *after* the CRC,

@@ -256,7 +256,31 @@ _ALS_LOG_DDL = """CREATE TABLE als_log(
     event_type INTEGER NOT NULL,
     spectral_data BLOB,
     is_saturated INTEGER,
-    integration_time INTEGER)"""
+    integration_time INTEGER,
+    device_ts_ns INTEGER,
+    device_ts_ptp INTEGER,
+    imu_trailer_version INTEGER,
+    imu_flags INTEGER,
+    imu_cal_applied INTEGER,
+    imu_sample_age_ms INTEGER,
+    imu_x_mg REAL,
+    imu_y_mg REAL,
+    imu_z_mg REAL,
+    imu_mag_mg REAL,
+    imu_tilt_deg REAL,
+    imu_roll_deg REAL,
+    imu_pitch_deg REAL,
+    imu_temp_raw INTEGER)"""
+
+# Columns beyond the five a minimal recorder fills. Names and meanings are
+# Chloros's (daq/sensors/base.py DAQULogger.write) -- a .daq is one format, so
+# a column that means something different here than there is worse than no
+# column. NOTE Chloros's import path does not currently READ the imu_* set;
+# its own recorder writes them as provenance and so do we.
+_IMU_COLUMNS = (
+    "imu_trailer_version", "imu_flags", "imu_cal_applied", "imu_sample_age_ms",
+    "imu_x_mg", "imu_y_mg", "imu_z_mg", "imu_mag_mg",
+    "imu_tilt_deg", "imu_roll_deg", "imu_pitch_deg", "imu_temp_raw")
 
 _VALID_KINDS = ("daq-u", "daq-m", "daq-e", "daq-e-s")
 
@@ -294,6 +318,30 @@ _DEFAULT_CAP_BY_KIND = {
     "daq-e": "sunshine_cosine",
     "daq-e-s": "as_recorded",
 }
+
+
+def _as_int(v):
+    """int(v), or None. NaN and non-numerics become None, never 0."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else int(f)
+
+
+def _as_float(v):
+    """float(v), or None. A NaN angle means "undefined" in some drivers and
+    is absent in others; a column that means "the angle was undefined" should
+    not depend on which."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
 
 
 def _spectrum_to_blob(spectrum):
@@ -475,7 +523,7 @@ class DaqWriter:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             # 1.25: cap_id_source. Matches the hub's schema number for the
             # same column, so two files claiming one version have one shape.
-            ("1.25", kind, str(product_serial).strip(), str(device_name),
+            ("1.27", kind, str(product_serial).strip(), str(device_name),
              int(bool(calibration_applied)),
              str(calibration_bundle_sha or ""),
              str(calibration_completed_utc or ""),
@@ -485,7 +533,8 @@ class DaqWriter:
         self._count = 0
 
     def write(self, spectrum, is_saturated, integration_time_ms,
-              timestamp_ns=None):
+              timestamp_ns=None, *, device_timestamp_ns=None,
+              device_ts_ptp=None, imu=None):
         """Append one spectrum reading.
 
         spectrum : sequence/np.ndarray of raw sensor counts (the sensor's
@@ -504,11 +553,49 @@ class DaqWriter:
             raise RuntimeError("DaqWriter is closed")
         if timestamp_ns is None:
             timestamp_ns = time.time_ns()
+        # The sensor's own clock, normalised at this ONE choke point so no
+        # caller can produce a row whose flag and stamp disagree. A pre-2000
+        # value is a boot counter or unscaled microseconds, not an epoch:
+        # recording it would look absolute to a reader and drag the whole file
+        # onto a nonsense time axis, so refuse it and keep NULL.
+        dev_ts = dev_ptp = None
+        if device_timestamp_ns:
+            _v = int(device_timestamp_ns)
+            if _v > 946684800_000_000_000:            # 2000-01-01 in ns
+                dev_ts = _v
+                dev_ptp = 1 if device_ts_ptp else 0
+
+        # Attitude, same rule: the caller hands over a trailer dict, this
+        # decides what a column may contain. No default-to-zero anywhere -- a
+        # missing angle is NULL, never 0.0, because 0 degrees means PERFECTLY
+        # LEVEL and that is the single most dangerous value to invent for a
+        # column whose whole purpose is deciding whether a cosine correction
+        # held.
+        if isinstance(imu, dict):
+            imu_row = (
+                _as_int(imu.get("trailer_version")),
+                _as_int(imu.get("flags")),
+                1 if imu.get("cal_applied") else 0,
+                _as_int(imu.get("sample_age_ms")),
+                _as_float(imu.get("x_mg")), _as_float(imu.get("y_mg")),
+                _as_float(imu.get("z_mg")), _as_float(imu.get("mag_mg")),
+                _as_float(imu.get("tilt_deg")), _as_float(imu.get("roll_deg")),
+                _as_float(imu.get("pitch_deg")), _as_int(imu.get("temp_raw")),
+            )
+        else:
+            # Twelve NULLs, imu_cal_applied among them: with no trailer the
+            # question "were these axes corrected" has no answer, and 0 would
+            # assert the wrong one.
+            imu_row = (None,) * 12
+
         self._conn.execute(
             "INSERT INTO als_log (event_type, precise_timestamp, "
-            "spectral_data, is_saturated, integration_time) VALUES (?,?,?,?,?)",
+            "spectral_data, is_saturated, integration_time, "
+            "device_ts_ns, device_ts_ptp, " + ", ".join(_IMU_COLUMNS) + ") "
+            "VALUES (?,?,?,?,?, ?,?, ?,?,?,?,?,?,?,?,?,?,?,?)",
             (3, int(timestamp_ns), _spectrum_to_blob(spectrum),
-             int(bool(is_saturated)), int(integration_time_ms)))
+             int(bool(is_saturated)), int(integration_time_ms),
+             dev_ts, dev_ptp) + imu_row)
         self._count += 1
         if self._count % 10 == 0:
             self._conn.commit()

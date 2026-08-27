@@ -16,6 +16,7 @@ Two halves:
 Run:  python selftest.py
 """
 import contextlib
+import csv
 import hashlib
 import io
 import json
@@ -237,7 +238,7 @@ def test_metadata_contract():
     # this file writes, not to a number for its own sake: two producers
     # claiming one version with different als_meta columns is the trap the
     # hub already walked into.
-    check("daq als_meta v1.25", meta['version'] == '1.25', meta['version'])
+    check("daq als_meta v1.27", meta['version'] == '1.27', meta['version'])
     check("daq records WHO chose the cap",
           meta['cap_id_source'] in mm._CAP_ID_SOURCES, meta['cap_id_source'])
     check("daq declares UTC stamps (utc_offset_minutes=0)",
@@ -883,6 +884,210 @@ def test_set_device_cap():
         sys.path[:] = saved
 
 
+def test_stream_recording():
+    """All three DAQ-E streams, into the format each can honestly carry.
+
+    raw and calibrated spectra become a .daq AND a .csv; attitude becomes a
+    .csv and is refused a .daq, because Chloros only reads als_log rows that
+    have spectral_data and an attitude sample is not a spectrum. A DAQ-E-S
+    folds its attitude into the spectral frames as a trailer, and THAT does
+    reach the .daq's imu_* columns -- which is the path that carries tilt
+    alongside the irradiance it qualifies.
+    """
+    print("\n-- record the streams (daq_stream --daq / --csv / --imu) --")
+    import daq_stream as ds
+    import sqlite3 as _sq
+
+    tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "_selftest_out")
+    os.makedirs(tmp, exist_ok=True)
+
+    def _trailer():
+        t = bytearray(22)
+        t[0] = 0x01
+        t[1] = 0x01 | 0x02 | 0x04 | 0x08 | 0x10
+        struct.pack_into("<H", t, 2, 12)
+        struct.pack_into("<hhh", t, 4, 10, -5, 1000)
+        struct.pack_into("<H", t, 10, 250)      # tilt   2.50
+        struct.pack_into("<h", t, 12, -125)     # roll  -1.25
+        struct.pack_into("<h", t, 14, 75)       # pitch  0.75
+        struct.pack_into("<H", t, 16, 1001)
+        struct.pack_into("<b", t, 18, 7)
+        struct.pack_into("<H", t, 20, ds._crc16_ccitt(bytes(t[:20])))
+        return bytes(t)
+
+    def _spectral(cal, n=4):
+        if cal:
+            payload = struct.pack("<%df" % n, *[1.5] * n)
+            flags = 0x02 | 0x08
+        else:
+            payload = (b"\x03\xbb\x28\x00" + struct.pack("<H", 50)
+                       + b"\x00\x00" + struct.pack("<I", n)
+                       + struct.pack("<%df" % n, *[100.0] * n))
+            flags = 0x02
+        flags |= 0x04 | 0x10                    # ptp + imu trailer
+        d = bytearray(32)
+        d[0:2] = b"\xda\x0e"; d[2] = 2; d[3] = flags
+        struct.pack_into("<I", d, 4, 3)
+        struct.pack_into("<Q", d, 8, 1_752_600_000_000_000)
+        d[16:22] = b"\xaa\xbb\xcc\xdd\xee\xff"
+        d[22:27] = b"\x11\x22\x33\x44\x55"
+        d[27] = 1                               # daq-e-s
+        struct.pack_into("<H", d, 28, 50)
+        struct.pack_into("<H", d, 30, len(payload))
+        d += payload
+        d += struct.pack("<H", ds._crc16_ccitt(bytes(d)))
+        return bytes(d) + _trailer()
+
+    def _attitude():
+        d = bytearray(58)
+        d[0:2] = b"\xda\x0e"; d[2] = 0x03; d[3] = 0x02 | 0x04
+        struct.pack_into("<I", d, 4, 42)
+        struct.pack_into("<Q", d, 8, 1_752_600_000_000_000)
+        d[16:22] = b"\xaa\xbb\xcc\xdd\xee\xff"
+        d[22:27] = b"\x11\x22\x33\x44\x55"
+        d[27] = 1
+        d[28] = 0x01 | 0x02 | 0x04 | 0x08 | 0x10
+        struct.pack_into("<H", d, 30, 9)
+        struct.pack_into("<hhh", d, 32, 1, 2, 3)
+        struct.pack_into("<hhh", d, 38, 4, 5, 6)
+        struct.pack_into("<HhhHH", d, 44, 250, -125, 75, 1234, 500)
+        struct.pack_into("<h", d, 54, 7)
+        struct.pack_into("<H", d, 56, ds._crc16_ccitt(bytes(d[:56])))
+        return bytes(d)
+
+    def _run(argv, payload):
+        class _S:
+            def setsockopt(self, *a): pass
+            def setblocking(self, *a): pass
+            def settimeout(self, *a): pass
+            def bind(self, *a): pass
+            def close(self): pass
+            def recvfrom(self, _n): return payload, ("10.0.0.9", 5002)
+        real = ds.socket.socket
+        ds.socket.socket = lambda *a, **k: _S()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ds.main(argv)
+        finally:
+            ds.socket.socket = real
+
+    for cal in (False, True):
+        tag = "cal" if cal else "raw"
+        dq = os.path.join(tmp, "stream_rec_%s.daq" % tag)
+        cv = os.path.join(tmp, "stream_rec_%s.csv" % tag)
+        argv = ["--count", "2", "--daq", dq, "--csv", cv, "--quiet",
+                "--duration", "5"] + (["--calibrated"] if cal else [])
+        _run(argv, _spectral(cal))
+
+        meta, specs = chloros_read_daq(dq)
+        check(f"{tag} stream -> a .daq Chloros can read",
+              len(specs) == 2 and meta["product_serial"] == "11-22-33-44-55")
+        # THE labelling property: a calibrated stream that does not declare
+        # itself gets its bundle applied a second time at import.
+        check(f"{tag} stream .daq declares calibration_applied={int(cal)}",
+              meta["calibration_applied"] is cal,
+              f"got {meta['calibration_applied']}")
+        check(f"{tag} stream .daq records the model it heard",
+              meta["product_model"] == "daq-e-s", meta["product_model"])
+
+        conn = _sq.connect(dq)
+        row = conn.execute("SELECT imu_tilt_deg, imu_roll_deg, imu_pitch_deg, "
+                           "imu_cal_applied, device_ts_ptp FROM als_log "
+                           "LIMIT 1").fetchone()
+        conn.close()
+        check(f"{tag} stream .daq carries the attitude trailer",
+              row == (2.5, -1.25, 0.75, 1, 1), str(row))
+
+        rows = list(csv.reader(open(cv, newline="", encoding="utf-8")))
+        hdr = next(r for r in rows if r and r[0] == "device")
+        data = rows[rows.index(hdr) + 1]
+        check(f"{tag} stream .csv states its units",
+              data[hdr.index("units")] == ("W/m^2/nm" if cal else "counts"))
+        check(f"{tag} stream .csv carries tilt alongside the spectrum",
+              data[hdr.index("tilt_deg")] == "2.5")
+
+    cv = os.path.join(tmp, "stream_rec_imu.csv")
+    _run(["--imu", "--count", "2", "--csv", cv, "--quiet", "--duration", "5"],
+         _attitude())
+    rows = list(csv.reader(open(cv, newline="", encoding="utf-8")))
+    check("attitude stream -> its own .csv",
+          rows[0][0].startswith("# MAPIR") and "attitude" in rows[0][0],
+          rows[0][0])
+    hdr, data = rows[1], rows[2]
+    check("attitude .csv carries the corrected AND raw triplets",
+          {"x_mg", "raw_x_mg", "tare_angle_deg"} <= set(hdr))
+    check("attitude .csv decodes the angles",
+          data[hdr.index("tilt_deg")] == "2.5"
+          and data[hdr.index("roll_deg")] == "-1.25")
+
+    def _refuses_daq():
+        try:
+            _run(["--imu", "--daq", os.path.join(tmp, "no.daq"), "--count",
+                  "1", "--quiet"], _attitude())
+            return False
+        except SystemExit:
+            return True
+    check("attitude is REFUSED a .daq, with the reason", _refuses_daq(),
+          "an als_log row with no spectral_data is invisible to Chloros")
+
+    # An undefined angle must stay empty, never 0 -- 0 degrees means
+    # PERFECTLY LEVEL, the single most dangerous value to invent for a column
+    # whose purpose is deciding whether a cosine correction held.
+    t = bytearray(_trailer())
+    struct.pack_into("<H", t, 10, 0xFFFF)          # tilt: not computed
+    struct.pack_into("<H", t, 20, ds._crc16_ccitt(bytes(t[:20])))
+    imu = ds.parse_imu_trailer(bytes(t))
+    check("an uncomputed angle decodes to None, not 0",
+          imu is not None and imu["tilt_deg"] is None)
+    check("...and reaches the CSV as empty, not 0", ds._csv_cell(None) == "")
+
+    # Two decoders of one wire format that disagree are worse than one
+    # decoder. This file now carries a copy of Chloros's IMU decode, so pin
+    # the copy to the original over the values that actually vary: the flag
+    # combinations and the "firmware wrote nothing" sentinels.
+    repo = _chloros_repo()
+    if repo is None:
+        skip("IMU decode matches Chloros field for field",
+             "set CHLOROS_REPO to a mapirlab checkout")
+        return
+    saved = list(sys.path)
+    try:
+        sys.path.insert(0, repo)
+        from daq.sensors import e as _chl
+        bad = []
+        for flags in (0x00, 0x02, 0x04, 0x10, 0x1F, 0xFF):
+            for tilt, roll, pitch in ((250, -125, 75), (0xFFFF, 0x7FFF, 0x7FFF),
+                                      (0, 0, 0), (18000, -18000, 9000)):
+                t = bytearray(_trailer())
+                t[1] = flags
+                struct.pack_into("<H", t, 10, tilt)
+                struct.pack_into("<h", t, 12, roll)
+                struct.pack_into("<h", t, 14, pitch)
+                struct.pack_into("<H", t, 20,
+                                 ds._crc16_ccitt(bytes(t[:20])))
+                if ds.parse_imu_trailer(bytes(t)) != _chl.parse_imu_trailer(bytes(t)):
+                    bad.append((flags, tilt, roll, pitch))
+        check("IMU trailer decode matches Chloros field for field",
+              not bad, f"{len(bad)} mismatch(es), e.g. {bad[:2]}")
+
+        a = ds.parse_imu_datagram(_attitude())
+        b = _chl.parse_imu_datagram(_attitude())
+        shared = set(a) & set(b)
+        diff = sorted(k for k in shared if a[k] != b[k])
+        check("attitude datagram decode matches Chloros on every shared key",
+              not diff, str(diff))
+        # The two timestamp keys are deliberately named for THIS module's
+        # spectral parser; everything else must line up.
+        check("only the timestamp key names differ, and knowingly",
+              sorted(set(b) - set(a)) == ["absolute_ts", "ts_us"],
+              str(sorted(set(b) - set(a))))
+    except ImportError as e:
+        skip("IMU decode matches Chloros field for field", f"import failed: {e}")
+    finally:
+        sys.path[:] = saved
+
+
 def test_export_round_trip():
     """Chloros exports a calibrated .daq; re-importing it must not calibrate
     it a second time.
@@ -1062,10 +1267,24 @@ def test_multicast_stream():
         crc = ds._crc16_ccitt(bytes(d)) ^ (0xFFFF if corrupt else 0)
         d += struct.pack("<H", crc)
         if imu:
-            # 22 bytes, from PROTOCOL.md -- a wire fact, written out rather
-            # than read from daq_stream, so this builder still produces a
-            # real DAQ-E-S frame if that module's constant is wrong or absent.
-            d += bytes(22)                     # trailer sits AFTER the crc
+            # A REAL 22-byte trailer, not 22 zero bytes: has_imu means the
+            # trailer DECODED, so a placeholder would test the failure path
+            # while looking like it tested the success one. Offsets are wire
+            # facts from PROTOCOL.md, written out rather than read from
+            # daq_stream so this builder still produces a genuine DAQ-E-S
+            # frame if that module's constants are wrong or absent.
+            t = bytearray(22)
+            t[0] = 0x01                                    # trailer version
+            t[1] = 0x01 | 0x02 | 0x04 | 0x08 | 0x10        # fresh|angles|cal|healthy|temp
+            struct.pack_into("<H", t, 2, 12)               # sample_age_ms
+            struct.pack_into("<hhh", t, 4, 10, -5, 1000)   # x/y/z mg
+            struct.pack_into("<H", t, 10, 250)             # tilt  2.50 deg
+            struct.pack_into("<h", t, 12, -125)            # roll -1.25 deg
+            struct.pack_into("<h", t, 14, 75)              # pitch 0.75 deg
+            struct.pack_into("<H", t, 16, 1001)            # |a| mg
+            struct.pack_into("<b", t, 18, 7)               # temp trend
+            struct.pack_into("<H", t, 20, ds._crc16_ccitt(bytes(t[:20])))
+            d += bytes(t)                     # trailer sits AFTER the crc
         return bytes(d)
 
     f = ds.parse_datagram(frame(2), "10.0.0.5")
@@ -1097,6 +1316,22 @@ def test_multicast_stream():
           fi is not None and fi["spectrum"] == [100.0] * 4)
     check("...and the trailer's presence is reported",
           fi is not None and fi.get("has_imu") is True)
+    check("...and the attitude decodes",
+          fi is not None and fi.get("imu") is not None
+          and fi["imu"]["tilt_deg"] == 2.5
+          and fi["imu"]["roll_deg"] == -1.25
+          and fi["imu"]["pitch_deg"] == 0.75
+          and fi["imu"]["cal_applied"] is True
+          and fi["imu"]["temp_raw"] == 7,
+          None if fi is None else str(fi.get("imu"))[:70])
+    # A trailer whose crc does not check out must read as "no IMU on this
+    # frame", never as a tilt of whatever the corrupt bytes happened to say.
+    _bad = bytearray(with_imu)
+    _bad[-1] ^= 0xFF
+    _g = ds.parse_datagram(bytes(_bad), "10.0.0.5")
+    check("a corrupt trailer degrades to no-IMU, keeping the spectrum",
+          _g is not None and _g["spectrum"] == [100.0] * 4
+          and _g["imu"] is None and _g["has_imu"] is False)
     check("a frame with no trailer reports none",
           (ds.parse_datagram(frame(2), "x") or {}).get("has_imu") is False)
     check("a TRUNCATED trailer does not cost the spectrum",
@@ -1242,6 +1477,7 @@ def main():
     test_offline_calibration()
     test_cap_declaration()
     test_set_device_cap()
+    test_stream_recording()
     test_export_round_trip()
     test_multicast_stream()
     n = sum(RESULTS)

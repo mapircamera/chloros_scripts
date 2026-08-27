@@ -517,9 +517,14 @@ def main(argv=None):
                         "'bake' writes calibrated values into the .daq "
                         "(self-contained but no longer reprocessable). "
                         "Default 'off' (raw only).")
-    p.add_argument("--csv", metavar="PATH",
-                   help="explicit path for --calibrate csv output "
-                        "(default: the .daq path with a .csv suffix)")
+    p.add_argument("--csv", metavar="PATH", nargs="?", const=True,
+                   help="also write a CSV of what this run records -- "
+                        "calibrated W/m^2/nm with --calibrate csv, otherwise "
+                        "the same RAW counts that go into the .daq. Bare "
+                        "--csv puts it beside the .daq; give a PATH to place "
+                        "it. Raw CSV is the only CSV a DAQ-U or DAQ-M can "
+                        "produce, since neither carries a bundle to "
+                        "calibrate against locally.")
     p.add_argument("--cap-id",
                    help="which cap is fitted. Default: the cap this model "
                         "ships wearing -- 'sunshine_cosine' for DAQ-U/M/E, "
@@ -664,20 +669,52 @@ def main(argv=None):
     csv_path = None
     csv_fh = None
     csv_out = None
-    if args.calibrate == "csv":
-        csv_path = args.csv or (os.path.splitext(out)[0] + ".csv")
+    # A CSV of whatever this run is recording. With --calibrate csv that is
+    # calibrated irradiance; otherwise it is the raw counts going into the
+    # .daq -- which is the only CSV a DAQ-U or DAQ-M can produce at all,
+    # since neither carries a bundle to calibrate against locally.
+    #
+    # The header says WHICH, in the file. Counts and W/m^2/nm differ by four
+    # orders of magnitude and nothing about the numbers announces which you
+    # are holding.
+    want_csv = args.csv or args.calibrate == "csv"
+    if want_csv:
+        csv_calibrated = (args.calibrate == "csv")
+        # Bare --csv (argparse const=True) means "beside the .daq".
+        csv_path = (args.csv if isinstance(args.csv, str)
+                    else os.path.splitext(out)[0] + ".csv")
         csv_fh = open(csv_path, "w", newline="", encoding="utf-8")
         csv_out = csv.writer(csv_fh)
-        # Header carries provenance so the file stands alone: anyone opening
-        # it later can tell which bundle and which cap produced the numbers.
-        csv_out.writerow([f"# MAPIR {kind} calibrated spectral irradiance "
-                          f"(W/m^2/nm)"])
-        csv_out.writerow([f"# sensor={serial_id} bundle_sha={cal.bundle_sha} "
-                          f"completed={cal.completed_utc} cap={cal.cap_id} "
-                          f"dark_model={cal.dark_model} "
-                          f"profiles={cal.profiles_source}"])
-        csv_out.writerow(["timestamp_ns", "integration_time_ms", "saturated"]
-                         + [f"{w:.1f}" for w in cal.wavelength_nm])
+        if csv_calibrated:
+            csv_out.writerow([f"# MAPIR {kind} calibrated spectral irradiance "
+                              f"(W/m^2/nm)"])
+            csv_out.writerow([f"# sensor={serial_id} "
+                              f"bundle_sha={cal.bundle_sha} "
+                              f"completed={cal.completed_utc} cap={cal.cap_id} "
+                              f"dark_model={cal.dark_model} "
+                              f"profiles={cal.profiles_source}"])
+        else:
+            csv_out.writerow([f"# MAPIR {product_model} RAW sensor counts "
+                              f"(NOT irradiance)"])
+            # The cap is provenance for the .daq beside this file, not
+            # something applied to these numbers -- say so, so nobody reads
+            # the column as already-corrected.
+            csv_out.writerow([f"# sensor={serial_id} uncalibrated; "
+                              f"cap={cap_stamp} ({cap_source or 'assumed'}) "
+                              f"is DECLARED for Chloros to apply, not applied "
+                              f"here"])
+        # Wavelength headers come from the bundle. A raw run has no
+        # bundle, and the .daq deliberately does not store the axis
+        # either (Chloros reconstructs it from the calibration), so a
+        # raw CSV carries bare sample indices rather than inventing
+        # nanometres it cannot know.
+        _wl = ([f"{w:.1f}" for w in cal.wavelength_nm]
+               if csv_calibrated else None)
+        _csv_header_written = bool(_wl)
+        if _wl:
+            csv_out.writerow(["timestamp_utc", "timestamp_ns",
+                              "integration_time_ms", "saturated",
+                              "calibrated", "units"] + _wl)
 
     print(f"Recording {'CALIBRATED' if baking else 'RAW'} to: "
           f"{os.path.abspath(out)}")
@@ -737,8 +774,24 @@ def main(argv=None):
                          is_saturated=sat, integration_time_ms=inttime,
                          timestamp_ns=ts)
             if csv_out is not None:
-                csv_out.writerow([ts, inttime, int(bool(sat))]
-                                 + [f"{v:.6g}" for v in calibrated])
+                _vals = calibrated if csv_calibrated else spec
+                if not _csv_header_written:
+                    # Raw: the point count is only known once a
+                    # frame has arrived, so the column row waits for
+                    # one rather than guessing 135.
+                    _csv_header_written = True
+                    csv_out.writerow(
+                        ["timestamp_utc", "timestamp_ns",
+                         "integration_time_ms", "saturated",
+                         "calibrated", "units"]
+                        + [f"idx_{i}" for i in range(len(_vals))])
+                csv_out.writerow(
+                    [datetime.fromtimestamp(ts / 1e9,
+                                            timezone.utc).isoformat(
+                        timespec="milliseconds"),
+                     ts, inttime, int(bool(sat)), int(csv_calibrated),
+                     "W/m^2/nm" if csv_calibrated else "counts"]
+                    + [f"{v:.6g}" for v in _vals])
             n += 1
             if n % 10 == 0:
                 print(f"  {n} readings ...", flush=True)
