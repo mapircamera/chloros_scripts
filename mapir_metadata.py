@@ -243,7 +243,31 @@ _ALS_LOG_DDL = """CREATE TABLE als_log(
     is_saturated INTEGER,
     integration_time INTEGER)"""
 
-_VALID_KINDS = ("daq-u", "daq-m", "daq-e")
+_VALID_KINDS = ("daq-u", "daq-m", "daq-e", "daq-e-s")
+
+# The cap correction Chloros will apply when a recording does not say
+# otherwise, per device model.
+#
+# MAPIR ships DAQ-U / DAQ-M / DAQ-E with the sunshine cosine corrector
+# PERMANENTLY INSTALLED for outdoor use, and the correction is large: mean
+# 30.6x on DAQ-U, 23.1x on DAQ-M, 11.0x on DAQ-E. A recording that declares
+# 'none' on a capped sensor is not "uncorrected", it is WRONG by that factor
+# (and on a DAQ-E worse still -- 'none' is an ACTIVE bare-geometry profile of
+# ~0.49x, so the round trip is ~22.6x). Chloros's own live recorder defaults
+# to sunshine_cosine for exactly this reason (backend_server.py
+# /api/daq/connect), so a raw recording made by these scripts has to declare
+# the same thing or the two paths disagree on identical hardware.
+#
+# A DAQ-E-S is the exception: its diffuser is fitted permanently and was on
+# the unit when its factory bundle was measured, so the correction is already
+# inside the gain and NO per-wavelength profile may apply on top. Chloros
+# resolves that model to 'as_recorded' and overrides any cap asked for.
+_DEFAULT_CAP_BY_KIND = {
+    "daq-u": "sunshine_cosine",
+    "daq-m": "sunshine_cosine",
+    "daq-e": "sunshine_cosine",
+    "daq-e-s": "as_recorded",
+}
 
 
 def _spectrum_to_blob(spectrum):
@@ -268,15 +292,34 @@ class DaqWriter:
 
     Parameters
     ----------
-    product_model : str   one of 'daq-u' / 'daq-m' / 'daq-e' (the device kind;
-                          Chloros maps it to the right cal bundle family).
+    product_model : str   one of 'daq-u' / 'daq-m' / 'daq-e' / 'daq-e-s'
+                          (the device kind; Chloros maps it to the right cal
+                          bundle family). Record a DAQ-E-S as itself, not as
+                          'daq-e': both use the kind-'e' bundle, but their cap
+                          treatment is OPPOSITE -- a DAQ-E-S carries its
+                          diffuser inside its own gain and must get no
+                          per-wavelength profile, while a plain DAQ-E needs
+                          the sunshine curve (~11x). A file that cannot tell
+                          them apart cannot be processed correctly.
     product_serial : str  the sensor's serial/id. THE CALIBRATION FETCH KEY.
     device_name : str     free-text label (optional).
-    cap_id : str          MAPIR cap-correction profile id if a cosine
-                          corrector / FOV cone is fitted, else 'none' for a
-                          bare sensor. Recorded raw (cap_applied=0); Chloros
-                          applies it at import. Leave 'none' unless MAPIR told
-                          you a specific cap id.
+    cap_id : str          Which cap correction Chloros should apply at
+                          import. Recorded as provenance only
+                          (``cap_applied=0``); Chloros applies it.
+
+                          **Default (None) resolves to the model's shipped
+                          state** -- ``sunshine_cosine`` for DAQ-U / DAQ-M /
+                          DAQ-E, ``as_recorded`` for DAQ-E-S -- because MAPIR
+                          ships the sunshine cosine corrector permanently
+                          installed, and Chloros's own recorder defaults to
+                          the same thing. Pass ``'none'`` ONLY for a sensor
+                          you have physically stripped: on a capped unit that
+                          declaration is wrong by the whole correction (mean
+                          30.6x on DAQ-U, 23.1x on DAQ-M, and ~22.6x on a
+                          DAQ-E, where 'none' is an ACTIVE ~0.49x
+                          bare-geometry profile rather than a no-op).
+                          ``'as_recorded'`` means "apply no per-wavelength
+                          profile at all".
     tz_offset_minutes : int
                           Timezone provenance (als_meta v1.23): the UTC
                           offset, in signed minutes, of the NAIVE wall-clock
@@ -315,7 +358,7 @@ class DaqWriter:
     """
 
     def __init__(self, path, *, product_model, product_serial,
-                 device_name="", cap_id="none", tz_offset_minutes=0,
+                 device_name="", cap_id=None, tz_offset_minutes=0,
                  calibration_applied=False, calibration_bundle_sha="",
                  calibration_completed_utc="", cap_applied=False):
         kind = str(product_model).strip().lower()
@@ -323,6 +366,18 @@ class DaqWriter:
             raise ValueError(
                 f"product_model must be one of {_VALID_KINDS}, got "
                 f"{product_model!r}")
+        # None (the default) means "whatever this model ships wearing".
+        # Resolved here rather than defaulted to 'none' in the signature: a
+        # bare declaration on a capped sensor is a 20-30x error that nothing
+        # downstream can detect, and every unit MAPIR ships is capped.
+        if cap_id is None:
+            cap_id = _DEFAULT_CAP_BY_KIND[kind]
+        # Readable back off the writer so a caller can PRINT what it is about
+        # to declare. The cap is the one field an operator can get wrong from
+        # the outside -- the sensor cannot sense what is screwed onto it -- so
+        # a recorder that resolves a default silently is hiding the single
+        # most consequential thing in the file.
+        self._cap_id = cap_id
         if not str(product_serial).strip():
             raise ValueError(
                 "product_serial is required -- it is the calibration fetch "
@@ -367,7 +422,7 @@ class DaqWriter:
              int(bool(calibration_applied)),
              str(calibration_bundle_sha or ""),
              str(calibration_completed_utc or ""),
-             (cap_id or "none"), int(bool(cap_applied)),
+             cap_id, int(bool(cap_applied)),
              int(tz_offset_minutes)))
         self._conn.commit()
         self._count = 0
@@ -400,6 +455,11 @@ class DaqWriter:
         self._count += 1
         if self._count % 10 == 0:
             self._conn.commit()
+
+    @property
+    def cap_id(self):
+        """The cap id actually stamped, after the model default resolved."""
+        return self._cap_id
 
     @property
     def record_count(self):

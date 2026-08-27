@@ -58,7 +58,11 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from mapir_metadata import DaqWriter
+from mapir_metadata import DaqWriter, _VALID_KINDS
+
+# "apply no per-wavelength profile at all" -- mirrors daq_cal.CAP_ID_AS_RECORDED
+# and Chloros's daq.calibration_apply._CAP_ID_AS_RECORDED.
+CAP_ID_AS_RECORDED = "as_recorded"
 
 # DAQ-E JSON control channel (TCP 5001): reads the sensor's name (its
 # calibration serial) and firmware at connect, and -- with --calibrate --
@@ -364,6 +368,11 @@ class DaqSensor:
         self.enable_ae = enable_ae
         self.sensor_id = None
         self.fw = None
+        # DAQ-E only: 'daq-e' or 'daq-e-s', straight from the hello. It
+        # decides the cap default and it is NOT cosmetic -- a DAQ-E-S carries
+        # its diffuser inside its own gain, so the sunshine profile a plain
+        # DAQ-E needs would double-count it by ~11x.
+        self.model = None
 
     def _exchange(self, command, want_cmd, timeout):
         """Send a command and return the next response with code want_cmd,
@@ -383,6 +392,11 @@ class DaqSensor:
             hello = self._control.cmd({"cmd": "hello"})
             self.fw = hello.get("fw")
             self.sensor_id = hello.get("name") or self.t.host
+            # Read from hello rather than inferred from imu_present: a
+            # DAQ-E-S whose IMU has failed would otherwise be misread as a
+            # plain DAQ-E and silently given the wrong cap. Same source
+            # Chloros uses (daq/sensors/e.py).
+            self.model = hello.get("model") or None
         self.t.open()
         # Wake the sensor.
         self._exchange(cmd_hello(), CMD_HELLO, timeout=5.0)
@@ -507,15 +521,20 @@ def main(argv=None):
                    help="explicit path for --calibrate csv output "
                         "(default: the .daq path with a .csv suffix)")
     p.add_argument("--cap-id",
-                   help="override the cap profile the device reports. The "
-                        "device carries ONE resolved profile, so the only "
-                        "accepted values are 'as_recorded' (skip all "
-                        "per-wavelength profiles) or the cap it already "
-                        "carries. Naming a different cap is refused -- there "
-                        "is no local copy of its correction curve, and "
-                        "applying the stored one under another name is ~11x "
-                        "off between sunshine and bare. To change caps, "
-                        "re-push profiles from Chloros.")
+                   help="which cap is fitted. Default: the cap this model "
+                        "ships wearing -- 'sunshine_cosine' for DAQ-U/M/E, "
+                        "'as_recorded' for a DAQ-E-S. Pass 'none' ONLY for a "
+                        "sensor you have physically stripped: declaring bare "
+                        "on a capped unit reads 20-30x low at import and "
+                        "nothing downstream can detect it. WITH --calibrate "
+                        "this is also an override of the profile the device "
+                        "reports, and the device carries ONE resolved "
+                        "profile -- so there the only accepted values are "
+                        "'as_recorded' (skip all per-wavelength profiles) or "
+                        "the cap it already carries; naming a different one "
+                        "is refused, because applying the stored curve under "
+                        "another name is ~11x off between sunshine and bare. "
+                        "To change caps, re-push profiles from Chloros.")
     p.add_argument("--require-profiles", action="store_true",
                    help="with --calibrate, fail unless the device carries cap/"
                         "geometry profiles. Use when a cap IS fitted: without "
@@ -540,7 +559,8 @@ def main(argv=None):
     print(f"Connecting to {kind} ...", flush=True)
     serial_id = sensor.connect()
     print(f"  serial (cal key): {serial_id}"
-          + (f"   fw: {sensor.fw}" if sensor.fw else ""), flush=True)
+          + (f"   fw: {sensor.fw}" if sensor.fw else "")
+          + (f"   model: {sensor.model}" if sensor.model else ""), flush=True)
 
     # Offline calibration from the device's own flash. Reuses the already-open
     # control socket so we don't take a second of the DAQ-E's 4 control slots.
@@ -576,15 +596,61 @@ def main(argv=None):
 
     out = args.output or default_output(kind)
     baking = (args.calibrate == "bake")
+
+    # A DAQ-E-S is stamped as itself, not as a plain DAQ-E. Chloros maps both
+    # to bundle kind 'e', but the cap treatment is opposite: a DAQ-E-S has its
+    # diffuser inside its own gain and must get NO per-wavelength profile,
+    # while a plain DAQ-E needs the sunshine curve (~11x). A file that cannot
+    # tell them apart cannot be processed correctly.
+    # Normalised and validated: `model` is whatever the firmware chose to put
+    # in its hello, and an unrecognised string here would raise out of
+    # DaqWriter AFTER the sensor is already streaming -- losing the run over a
+    # spelling. Anything we do not recognise falls back to the --device kind
+    # and says so, which is the pre-DAQ-E-S behaviour.
+    product_model = kind
+    if kind == "daq-e" and sensor.model:
+        _m = str(sensor.model).strip().lower().replace("_", "-")
+        if _m in _VALID_KINDS:
+            product_model = _m
+        else:
+            print(f"  ! device reports model {sensor.model!r}, which this "
+                  f"script does not recognise -- recording as {kind}. If this "
+                  f"is a DAQ-E-S its cap default will be wrong; pass "
+                  f"--cap-id as_recorded.", file=sys.stderr, flush=True)
+
+    # Which cap Chloros should apply at import.
+    #   explicit --cap-id            -> verbatim (the operator's statement)
+    #   --calibrate reached the unit -> the profile the DEVICE carries, so the
+    #                                   .daq and the sibling .csv agree
+    #   otherwise                    -> None, and DaqWriter resolves the
+    #                                   model's shipped state (sunshine for
+    #                                   U/M/E, as_recorded for a DAQ-E-S).
+    # NOT 'none': every unit MAPIR ships wears the sunshine corrector, and
+    # declaring bare on a capped sensor is a 20-30x error at import that
+    # nothing downstream can detect.
+    cap_stamp = args.cap_id or (cal.cap_id if cal else None)
+
+    # cap_applied describes what is IN the blobs, so it has to follow the cap
+    # actually handed to cal.apply() below -- not merely whether the device
+    # had profiles. `--cap-id as_recorded` tells apply() to skip every
+    # per-wavelength profile, so a recording made that way carries NO cap
+    # however well stocked the device is; stamping 1 there claims a
+    # correction that is not present, and Chloros then REFUSES a later
+    # operator cap override (it cannot undo a curve that was never applied)
+    # instead of correcting the file.
+    cap_was_applied = (baking and cal is not None
+                       and cal.profiles_source != "none"
+                       and args.cap_id != CAP_ID_AS_RECORDED
+                       and cap_stamp != CAP_ID_AS_RECORDED)
+
     writer = DaqWriter(
-        out, product_model=kind, product_serial=serial_id,
+        out, product_model=product_model, product_serial=serial_id,
         device_name=args.device_name,
-        cap_id=(args.cap_id or (cal.cap_id if cal else "none")),
+        cap_id=cap_stamp,
         calibration_applied=baking,
         calibration_bundle_sha=(cal.bundle_sha if baking else ""),
         calibration_completed_utc=(cal.completed_utc if baking else ""),
-        cap_applied=(baking and cal is not None
-                     and cal.profiles_source != "none"))
+        cap_applied=cap_was_applied)
 
     csv_path = None
     csv_fh = None
@@ -606,6 +672,22 @@ def main(argv=None):
 
     print(f"Recording {'CALIBRATED' if baking else 'RAW'} to: "
           f"{os.path.abspath(out)}")
+    # State the cap, always. It is the one field an operator can get wrong
+    # from the outside -- the sensor cannot sense what is screwed onto it --
+    # and getting it wrong is 20-30x in downwelling, which is silent because
+    # nothing downstream can check it against anything.
+    _stamped = writer.cap_id
+    _src = ("--cap-id" if args.cap_id else
+            "read from the device" if cal else
+            f"default for {product_model}")
+    print(f"  cap declared: {_stamped}  ({_src})")
+    if _stamped == "none":
+        for _line in (
+                "  ! 'none' declares the cap PHYSICALLY REMOVED. MAPIR ships",
+                "    these sensors with the sunshine corrector installed;",
+                "    declaring bare on a capped unit reads 20-30x low at",
+                "    import. Pass --cap-id sunshine_cosine if it is fitted."):
+            print(_line, file=sys.stderr, flush=True)
     if csv_path:
         print(f"  calibrated CSV: {os.path.abspath(csv_path)}")
     if baking:

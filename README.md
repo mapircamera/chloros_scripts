@@ -243,6 +243,16 @@ revised bundle. Prefer it for anything you intend to keep.
 
 Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
 
+**What you can record, and to what.** The `.daq` format Chloros ingests holds
+one thing: the sensor's spectra. `record_daq.py` writes it from the **raw**
+channel — that is the reprocessable master, and the only stream that becomes a
+`.daq`. The calibrated stream and the IMU stream are read-only here:
+`daq_stream.py` will log the calibrated stream to CSV, and nothing in this
+repo records the IMU stream at all (Chloros does). So "which stream do I
+record?" has one answer for a `.daq` — raw — and the calibrated numbers come
+either from `--calibrate` (locally, DAQ-E) or from Chloros at import (any
+model).
+
 **The IMU trailer.** On firmware **1.8.0+** — which is every DAQ-E-S — a
 spectral frame can carry a 22-byte attitude trailer appended *after* the CRC,
 announced by flags bit 4. It sits outside the CRC deliberately, so a corrupt
@@ -364,9 +374,31 @@ a **bare** DAQ-E has a geometry correction (the bare diffuser over-reads
 directional light ~2×, while a sunshine cap is near-ideal). None of that is in
 the calibration bundle — it lives in Chloros and is versioned separately.
 
-So the cap is **not a device setting you can change from these scripts.** It is
-resolved by Chloros for the unit and pushed into the device's profile store,
-where `daq_cal.py` reads it. `daq_cal.py <host>` prints which cap is aboard.
+**Every recording declares a cap, and the default is the cap the unit ships
+wearing.** MAPIR installs the sunshine cosine corrector permanently for outdoor
+use, so `record_daq.py` stamps `sunshine_cosine` for DAQ-U / DAQ-M / DAQ-E, and
+`as_recorded` for a DAQ-E-S (whose diffuser was on the unit when its factory
+bundle was measured — no profile may apply on top). That matches what Chloros's
+own recorder declares, so both paths agree on identical hardware. The cap is
+recorded as *provenance* — `cap_applied = 0` — and Chloros applies it at import.
+
+Pass `--cap-id none` **only** for a sensor you have physically stripped.
+Declaring bare on a capped unit is not "uncorrected", it is wrong by the whole
+correction, and nothing downstream can detect it:
+
+| Model | `sunshine_cosine` | declaring `none` instead |
+|-------|------------------|--------------------------|
+| DAQ-U | ×30.6 | **~30× low** |
+| DAQ-M | ×23.1 | **~23× low** |
+| DAQ-E | ×11.0 | **~22.6× low** — on a DAQ-E `none` is an *active* ×0.49 bare-geometry profile, not a no-op |
+
+`record_daq.py` prints the cap it declared on every run, and warns when that is
+`none`.
+
+The **profile curves themselves** are not a device setting you can change from
+these scripts. They are resolved by Chloros for the unit and pushed into the
+device's profile store, where `daq_cal.py` reads them. `daq_cal.py <host>`
+prints which cap is aboard.
 
 | Situation | Result |
 |-----------|--------|
@@ -374,12 +406,42 @@ where `daq_cal.py` reads it. `daq_cal.py <host>` prints which cap is aboard.
 | Device carries **no** profile | **bare-uncorrected** — ~2× off bare, ~11× off under a sunshine cap |
 | Physical cap changed | re-push from Chloros; the scripts cannot substitute another cap's curve |
 
-`--cap-id` is an override, not a cap selector. The device carries exactly one
-resolved profile, so the only accepted values are `as_recorded` (skip every
-per-wavelength profile) or the cap the device already carries. Naming a
-different cap is **refused** — there is no local copy of its correction curve,
-and applying the stored one under another name would be silently wrong by the
-sunshine-vs-bare factor. Validated at startup, not mid-recording.
+`--cap-id` means two different things depending on whether the run reads the
+device:
+
+- **With `--calibrate` (DAQ-E)** it is an override of the profile the device
+  carries, and the device carries exactly one — so the only accepted values are
+  `as_recorded` (skip every per-wavelength profile) or that same cap. Naming a
+  different one is **refused**: there is no local copy of its curve, and
+  applying the stored one under another name is silently wrong by the
+  sunshine-vs-bare factor. Validated at startup, not mid-recording.
+- **Without `--calibrate`** (every raw recording, and the only mode DAQ-U /
+  DAQ-M have) nothing is applied locally, so `--cap-id` simply *declares* what
+  is fitted, for Chloros to apply at import. Any id Chloros knows for that
+  device kind is accepted — `sunshine_cosine` (the default), `none`,
+  `fov_15`/`45`/`90`, and `fov_30`/`60` on DAQ-U.
+
+#### What each mode stamps
+
+The two flags Chloros reads are `calibration_applied` (are these W/m²/nm or
+counts?) and `cap_applied` (is a cap correction already multiplied in?).
+Between them they make every combination unambiguous, so nothing is ever
+calibrated or capped twice:
+
+| Run | `calibration_applied` | `cap_id` | `cap_applied` | Chloros applies |
+|-----|:---:|---|:---:|---|
+| `record_daq.py u/m/e` (default) | 0 | `sunshine_cosine` | 0 | bundle **+** that cap |
+| ... on a DAQ-E-S | 0 | `as_recorded` | 0 | bundle only, no profile |
+| ... `--cap-id none` (stripped) | 0 | `none` | 0 | bundle **+** bare geometry (DAQ-E) or nothing (U/M) |
+| `--calibrate csv` | 0 | the device's cap | 0 | bundle + that cap — and the sibling `.csv` already has both |
+| `--calibrate bake` | 1 | the device's cap | 1 | **nothing** — imported as-is |
+| `--calibrate bake --cap-id as_recorded` | 1 | `as_recorded` | 0 | nothing; a later cap override can still be applied |
+
+The last row is why `cap_applied` follows the cap actually handed to the
+calibrator rather than merely whether the device had profiles: `as_recorded`
+skips every profile, so stamping it as applied would claim a correction that
+is not in the data — and Chloros would then *refuse* a later operator override
+(it cannot undo a curve that was never applied) instead of correcting the file.
 
 Use `--require-profiles` to refuse outright rather than log a plausible wrong
 number when a cap is fitted but no profile is aboard:

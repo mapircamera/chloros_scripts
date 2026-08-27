@@ -621,6 +621,105 @@ def test_offline_calibration():
           cal.profiles_source == "none" and cal.cap_id == "none")
 
 
+def test_cap_declaration():
+    """The cap a recording declares, and what Chloros makes of it.
+
+    The cap is the one field an operator can get wrong from outside: the
+    sensor cannot sense what is screwed onto it, so the recording has to
+    SAY. Getting it wrong is 20-30x in downwelling and there is nothing
+    downstream that can check the number against anything.
+
+    MAPIR ships DAQ-U / DAQ-M / DAQ-E with the sunshine cosine corrector
+    permanently installed, and Chloros's own recorder declares
+    sunshine_cosine for that reason -- so a raw recording written here has to
+    declare the same thing, or the two paths disagree on identical hardware.
+    A DAQ-E-S is the exception in the opposite direction: its diffuser was on
+    the unit when its factory bundle was measured, so NO profile may apply.
+    """
+    print("\n-- cap declaration (what Chloros will apply) --")
+    tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "_selftest_out")
+    os.makedirs(tmp, exist_ok=True)
+
+    def stamped(model, **kw):
+        path = os.path.join(tmp, "cap_%s.daq" % model.replace("-", "_"))
+        w = mm.DaqWriter(path, product_model=model, product_serial="SN", **kw)
+        cap = w.cap_id
+        w.write(np.ones(135, dtype=np.float32), is_saturated=False,
+                integration_time_ms=32, timestamp_ns=1_752_600_000_000_000_000)
+        w.close()
+        return cap, chloros_read_daq(path)[0]
+
+    for model in ("daq-u", "daq-m", "daq-e"):
+        cap, meta = stamped(model)
+        check(f"{model} defaults to the cap it ships wearing",
+              cap == "sunshine_cosine" and meta["cap_id"] == "sunshine_cosine",
+              f"declared {cap!r}; 'none' on a capped unit reads 20-30x low")
+        check(f"{model} records the cap without applying it",
+              not meta["cap_applied"],
+              "raw spectra: Chloros applies the cap at import")
+
+    cap, meta = stamped("daq-e-s")
+    check("daq-e-s defaults to as_recorded (diffuser is inside its gain)",
+          cap == "as_recorded" and meta["cap_id"] == "as_recorded",
+          f"declared {cap!r}; sunshine on top double-counts it ~11x")
+
+    cap, _ = stamped("daq-u", cap_id="none")
+    check("an explicit 'none' is still honoured (physically stripped unit)",
+          cap == "none")
+
+    # A DAQ-E-S must be distinguishable in the file. Chloros maps both to
+    # bundle kind 'e', but their cap treatment is opposite, so a recording
+    # that calls a DAQ-E-S 'daq-e' cannot be processed correctly.
+    check("daq-e-s is a valid product_model", "daq-e-s" in mm._VALID_KINDS)
+    _, meta = stamped("daq-e-s")
+    check("...and survives into the file as itself",
+          meta["product_model"] == "daq-e-s", meta["product_model"])
+
+    # cap_applied describes the BLOBS. record_daq computes it from the cap it
+    # actually handed to apply(), so 'as_recorded' (which skips every
+    # profile) can never be stamped as applied -- doing so makes Chloros
+    # refuse a later operator override instead of correcting the file.
+    # record_daq gates cap_applied on this sentinel, and daq_cal.apply()
+    # returns early on it. If the two ever spell it differently, a recording
+    # made with --cap-id as_recorded is stamped as carrying a cap it does not
+    # have, and Chloros then REFUSES a later operator override instead of
+    # correcting the file.
+    import record_daq as _rd
+    import daq_cal as _dc
+    check("as_recorded sentinel agrees between record_daq and daq_cal",
+          _rd.CAP_ID_AS_RECORDED == _dc.CAP_ID_AS_RECORDED == "as_recorded",
+          f"{_rd.CAP_ID_AS_RECORDED!r} vs {_dc.CAP_ID_AS_RECORDED!r}")
+
+    repo = _chloros_repo()
+    if repo is None:
+        skip("live cap cross-check against mip.daq_dls",
+             "set CHLOROS_REPO to a mapirlab checkout")
+        return
+    saved = list(sys.path)
+    try:
+        sys.path.insert(0, repo)
+        from mip.daq_dls import _resolve_effective_cap, _cap_curve_or_none
+        # What Chloros resolves for a raw recording is the cap we declared.
+        for model, want in (("daq-u", "sunshine_cosine"),
+                            ("daq-e", "sunshine_cosine"),
+                            ("daq-e-s", "as_recorded")):
+            cap, _ = stamped(model)
+            check(f"Chloros resolves {model} default to {want}",
+                  _resolve_effective_cap("auto", cap, False) == want)
+        # And the correction really is the large factor claimed above, so
+        # "declare it or be 20-30x out" is a measured statement.
+        for kind, floor in (("daq-u", 20.0), ("daq-m", 15.0), ("daq-e", 10.0)):
+            curve = _cap_curve_or_none("sunshine_cosine", kind)
+            check(f"{kind} sunshine correction is large (>{floor:g}x)",
+                  curve is not None and float(np.mean(curve)) > floor,
+                  None if curve is None else "mean %.3gx" % float(np.mean(curve)))
+    except ImportError as e:
+        skip("live cap cross-check against mip.daq_dls", f"import failed: {e}")
+    finally:
+        sys.path[:] = saved
+
+
 def _chloros_repo():
     """A mapirlab checkout to cross-check against, or None.
 
@@ -992,6 +1091,7 @@ def main():
     test_cable_sync_ordering()
     test_camera_capture_flow()
     test_offline_calibration()
+    test_cap_declaration()
     test_export_round_trip()
     test_multicast_stream()
     n = sum(RESULTS)
