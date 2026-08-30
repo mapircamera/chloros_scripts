@@ -215,9 +215,29 @@ for rec in result["skipped"]:
 
 > **A recording whose calibration can't be fetched is skipped, not faked.** If
 > you are offline, or that serial has no calibration on file, Chloros reports
-> the recording under `skipped` **with the reason** and writes nothing for it —
-> rather than emitting a file named `*_calibrated.csv` that holds raw counts.
-> Reconnect, re-run, and it completes.
+> the recording under `skipped` **with the reason the file itself gives** — read
+> off the recording rather than assumed — and writes nothing for it, rather than
+> emitting a file named `*_calibrated.csv` that holds raw counts. Reconnect,
+> re-run, and it completes.
+
+**A family with no bundle at all exports as raw, under a `_raw` name.** The
+**DAQ-A** predates the DAQ-U/M/E bundle system and there is no bundle to fetch
+for one, ever — but it is still flown with a reflectance target and a Survey3,
+and Chloros calibrates with it, because only *relative* response matters there.
+So those recordings export as what they are: `<stem>_raw.daq` / `<stem>_raw.csv`
+rather than `_calibrated` (a different filename, not a flag inside the file, so
+the claim survives being emailed on as a bare name), a CSV header reading `raw
+spectral sensor counts (NOT irradiance)`, and a run summary saying `exported (N
+calibrated, M as RAW COUNTS)`. The power-dependent photometrics stay `NULL` and
+`calibration_applied` stays `0`, so re-importing one cannot double-apply
+anything. An *unknown* or blank model is **not** assumed bundle-less — erring
+that way would turn a real fetch failure into a silent raw export.
+
+**Legacy recordings export too.** A `.daq` on the old v1.01 / v1.02 schema has no
+`precise_timestamp` column, only the row write time. The downwelling matcher
+still refuses those, correctly — matching imagery needs a per-exposure epoch —
+but the exporter reads them on the `created_on` axis and says so in the product,
+via `clock=daq_created_on` in the CSV header.
 
 Your original raw `.daq` is never modified; the products are written alongside
 it. Keep the raw one — it is the master, and stays re-calibratable against a
@@ -238,7 +258,7 @@ revised bundle. Prefer it for anything you intend to keep.
 | Raw, unicast | TCP `5000` | raw counts, **one client at a time** | ✅ `record_daq.py` |
 | Raw, multicast | UDP `239.10.10.10:5002` | raw counts, any number of listeners | ✅ `daq_stream.py` |
 | Calibrated, multicast | UDP `239.10.10.11:5003` | W/m²/nm, when the device carries coefficients | ✅ `daq_stream.py --calibrated` |
-| IMU, multicast | UDP `239.10.10.12:5004` | attitude at its own rate, independent of spectra (fw 1.8.0+) | ➖ not read by these scripts |
+| Attitude, multicast | UDP `239.10.10.12:5004` | attitude at its own rate, independent of spectra (fw 1.12+) | ✅ `daq_stream.py --imu` |
 | Control | TCP `5001` | JSON: config, status, bundle/profile/cert | ✅ `daq_cal.py` |
 
 Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
