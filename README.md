@@ -25,7 +25,7 @@ coding) for DIY drone and research setups.
 |------|---------|
 | `capture_lattice.py` | Control + raw capture from **LATTICE cameras** (M3C/M3M), with hardware-cable multi-camera sync |
 | `record_daq.py` | Record raw spectra from a **DAQ-U / DAQ-M / DAQ-E** to a Chloros-compatible `.daq` |
-| `daq_stream.py` | Listen to **any number** of DAQ-E / DAQ-E-S sensors over multicast (raw or calibrated) |
+| `daq_stream.py` | Listen to **any number** of DAQ-E sensors over multicast (raw or calibrated) |
 | `daq_cal.py` | Apply a **DAQ-E**'s onboard factory calibration offline — no cloud, no Chloros |
 | `mapir_metadata.py` | The Chloros ingest contract: writes raw LATTICE TIFFs + the `.daq` SQLite format |
 | `selftest.py` | Self-contained checks that the output matches what Chloros reads on import |
@@ -247,7 +247,7 @@ future coefficient revision.
 
 A DAQ-E on firmware **1.7.0+** emits two spectral streams on separate multicast
 groups: **raw** counts (always) and **calibrated** W/m²/nm (once the device
-carries coefficients — a DAQ-E-S always does). Older firmware emits raw only.
+carries coefficients). Older firmware emits raw only.
 
 Raw is always the reprocessable one: it is the sensor's firmware output byte
 for byte, so a recording made from it can be re-calibrated later against a
@@ -258,7 +258,6 @@ revised bundle. Prefer it for anything you intend to keep.
 | Raw, unicast | TCP `5000` | raw counts, **one client at a time** | ✅ `record_daq.py` |
 | Raw, multicast | UDP `239.10.10.10:5002` | raw counts, any number of listeners | ✅ `daq_stream.py` |
 | Calibrated, multicast | UDP `239.10.10.11:5003` | W/m²/nm, when the device carries coefficients | ✅ `daq_stream.py --calibrated` |
-| Attitude, multicast | UDP `239.10.10.12:5004` | attitude at its own rate, independent of spectra (fw 1.12+) | ✅ `daq_stream.py --imu` |
 | Control | TCP `5001` | JSON: config, status, bundle/profile/cert | ✅ `daq_cal.py` |
 
 Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
@@ -269,56 +268,20 @@ Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blo
 |---|:---:|:---:|---|
 | Raw spectra | ✅ | ✅ | `record_daq.py <k> --csv` (any model) or `daq_stream.py --daq --csv` (DAQ-E) |
 | Calibrated spectra | ✅ | ✅ | `daq_stream.py --calibrated --daq --csv`, or `record_daq.py e --calibrate bake`/`csv` |
-| Attitude (IMU) | ✅ | ✅ | `daq_stream.py --imu --daq --csv`; the per-frame trailer also lands in a spectral `.daq`'s `imu_*` columns automatically |
 
 A calibrated recording is **stamped as calibrated** (`calibration_applied = 1`)
 from the frame's own flag bit, not from which group you joined — so Chloros
 imports it as-is instead of applying its bundle a second time.
 
-Attitude arrives two ways, and both are recorded:
-
-- **On each spectral frame**, as a 22-byte trailer. It lands in that reading's
-  own `imu_*` columns, so the tilt sits beside the irradiance it qualifies. Free
-  — no extra rows — but limited to the ~2.5 Hz spectra arrive at.
-- **On its own stream**, at the accelerometer's rate (~50 Hz). `--imu` records
-  it as `event_type = 4` rows carrying no spectrum. Chloros's spectral readers
-  never see them: `mip/daq_dls` predicates on `event_type = 3 AND spectral_data
-  IS NOT NULL`, and `mip/als.py` skips rows whose blob will not decode. Nothing
-  in Chloros reads them back *yet* — they are recorded so the data exists on the
-  same clock and in the same file as the spectra, instead of stranded in a
-  sidecar.
-
-**`--imu-rate` decides how much of that you keep, and it defaults to 5 Hz.**
-50 Hz is ten times the rows in both outputs and more than most work needs, so
-samples are thinned by their own timestamps (not by a frame counter, which
-would drift whenever the device's actual rate did). Raise it for vibration or
-fast-attitude work; `--imu-rate 0` keeps every sample.
-
-```bash
-# the default: 5 Hz, small files
-python daq_stream.py --imu --daq attitude.daq --csv attitude.csv
-
-# everything the device sends
-python daq_stream.py --imu --imu-rate 0 --daq attitude.daq
-```
-
-Measured on a 50 Hz stream: 5 Hz keeps a tenth of the samples and about a tenth
-of the CSV bytes.
-
 Raw remains the reprocessable master either way: a coefficient revision reaches
 every raw recording you kept and none of the device-calibrated ones.
 
-**The IMU trailer.** On firmware **1.8.0+** — which is every DAQ-E-S — a
-spectral frame can carry a 22-byte attitude trailer appended *after* the CRC,
-announced by flags bit 4. It sits outside the CRC deliberately, so a corrupt
-trailer can never cost you a good spectrum; the corollary is that **a reader
-must tolerate the extra bytes**. A reader that checks for an exact datagram
-length instead rejects every frame such a unit sends, counts them as malformed,
-and shows the sensor as absent while it streams perfectly. `daq_stream.py`
-accepts them and reports the trailer's presence in the `imu` CSV column; it
-does not decode the attitude itself — that layout lives in
-[`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md),
-and Chloros decodes it.
+**Validate on the declared length, not an exact size.** Firmware is free to
+append bytes after the CRC, and a reader that insists on one exact datagram size
+rejects every frame such a unit sends, counts them as malformed, and shows the
+sensor as absent while it streams perfectly. `daq_stream.py` tolerates trailing
+bytes; the layout lives in
+[`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
 
 **Chloros reads the raw stream, not the calibrated one.** It subscribes only to
 `239.10.10.10:5002` and applies the bundle *host-side*, from its own cloud
@@ -367,7 +330,7 @@ what makes multi-sensor and sensor-to-LATTICE alignment meaningful.
 **Every frame says which stream it came from.** Raw counts and calibrated
 W/m²/nm differ by roughly four orders of magnitude, and nothing about the
 numbers themselves announces which you are holding. So the CSV carries a
-`calibrated` column, a `units` column and an `imu` column per row — taken from the **frame's own
+`calibrated` column and a `units` column per row — taken from the **frame's own
 flag bit**, not from the group the script joined — plus a `#` provenance line
 naming the group and units at the top. If a frame's flag ever contradicts its
 group (a firmware bug: the two groups are meant to be exclusive), the script
@@ -433,20 +396,17 @@ the calibration bundle — it lives in Chloros and is versioned separately.
 DAQ-M / DAQ-E the sunshine corrector is **removable**, and nothing on the
 sensor can sense whether it is fitted — so somebody has to say. `record_daq.py`
 assumes `sunshine_cosine`, because that is how the large majority of units fly
-and it is the same assumption Chloros makes; a DAQ-E-S gets `as_recorded`
-instead, and that one is not an assumption (its diffuser is genuinely permanent
-and was on the unit when its factory bundle was measured, so no profile may
-apply on top).
+and it is the same assumption Chloros makes. An assumption is fine; an
+assumption that cannot be recognised later is not.
 
-Crucially the file records **which of those it was**, in
-`als_meta.cap_id_source`:
+So the file records **who decided the cap**, in `als_meta.cap_id_source`:
 
 | value | meaning |
 |---|---|
 | `auto_default` | **assumed** — nobody said, the fleet default was used |
 | `operator` | you stated it with `--cap-id` |
 | `device` | read back from the unit's own profile store |
-| `model` | settled by the hardware (DAQ-E-S) |
+| `model` | settled by the hardware — optics that are not removable leave no choice to make |
 
 That distinction is what makes an assumed cap **undoable**. Chloros warns on
 `auto_default` — naming the file — and an operator can override the cap per
@@ -539,7 +499,6 @@ calibrated or capped twice:
 | Run | `calibration_applied` | `cap_id` | `cap_applied` | Chloros applies |
 |-----|:---:|---|:---:|---|
 | `record_daq.py u/m/e` (default) | 0 | `sunshine_cosine` | 0 | bundle **+** that cap |
-| ... on a DAQ-E-S | 0 | `as_recorded` | 0 | bundle only, no profile |
 | ... `--cap-id none` (stripped) | 0 | `none` | 0 | bundle **+** bare geometry (DAQ-E) or nothing (U/M) |
 | `--calibrate csv` | 0 | the device's cap | 0 | bundle + that cap — and the sibling `.csv` already has both |
 | `--calibrate bake` | 1 | the device's cap | 1 | **nothing** — imported as-is |
@@ -557,15 +516,6 @@ number when a cap is fitted but no profile is aboard:
 ```bash
 python record_daq.py e --host 192.168.1.50 --calibrate csv --require-profiles
 ```
-
-None of this applies to a **DAQ-E-S** — the one model whose diffuser really is
-permanent. It was on the unit when its factory bundle was measured — the correction is
-already inside the gain. Chloros resolves that unit to `as_recorded` (no
-per-wavelength profile of any kind) and **overrides** any cap you ask for,
-because there is no cap choice to respect on optics that do not come off.
-Putting `sunshine_cosine` on top double-counts the diffuser: measured at ~11×,
-which integrates to 6× the solar constant above the atmosphere — physically
-impossible, and the tell that it has happened.
 
 Use `daq_cal.py <host>` to print exactly which correction chain a unit will
 run — dark model, whether π is applied at runtime or baked into the gain, and
