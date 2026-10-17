@@ -307,6 +307,147 @@ def test_wire_codec():
     check("read_spectrum skips ACK + matches", it2 == 32 and np.allclose(np.array(so2, "float32"), np.array(spin2, "float32")))
 
 
+class _RecDev(_FakeDev):
+    """_FakeDev that remembers every command code it was sent."""
+    def __init__(self, idb, spec):
+        super().__init__(idb, spec)
+        self.sent = []
+
+    def send(self, d):
+        self.sent.append(d[2])
+        super().send(d)
+
+
+class _FakeCtl:
+    """DAQ-E control channel: answers hello, nothing else needed here."""
+    def __init__(self, *a, **k): pass
+    def cmd(self, obj):
+        return {"ok": True, "name": "daq-e-a1b2c3", "fw": "1.14.1",
+                "model": "daq-e"}
+    def close(self): pass
+
+
+def _cal_135():
+    """A real DeviceCalibration on the 135-point grid the wire codec carries."""
+    import daq_cal
+    wl = [340.0 + 5.0 * i for i in range(135)]
+    return daq_cal.DeviceCalibration.from_bundle({
+        "completed_utc": "2026-01-02T03:04:05+00:00",
+        "run": {"device_kind": "daq-e", "sensor_id": "daq-e-a1b2c3"},
+        "stages": {
+            "dark": {"daq_dark_mean_w_per_m2_per_nm": 20.0,
+                     "daq_dark_rate_w_per_m2_per_nm": 3.0,
+                     "daq_dark_offset_per_ms_w_per_m2_per_nm": 17.0},
+            "wavelength_alignment": {"corrected_wavelength_grid_nm": wl},
+            "radiometric": {"gain_per_wavelength": [3.0e-5] * 135,
+                            "irradiance_geometry_factor_applied": False}}},
+        bundle_sha="5e1f" * 16, sensor_id="daq-e-a1b2c3")
+
+
+def _record(kind, argv, dev, *, cal=None, read_spectrum=None):
+    """Run record_daq.main() against fakes; return (stdout, stderr, error)."""
+    import daq_cal
+    saved = (R.SerialTransport, R.TcpTransport, R.DaqEControl,
+             R.DaqSensor.read_spectrum, daq_cal.DeviceCalibration.from_device)
+    R.SerialTransport = lambda *a, **k: dev
+    R.TcpTransport = lambda *a, **k: dev
+    R.DaqEControl = _FakeCtl
+    if cal is not None:
+        daq_cal.DeviceCalibration.from_device = classmethod(
+            lambda cls, *a, **k: cal)
+    if read_spectrum is not None:
+        R.DaqSensor.read_spectrum = read_spectrum
+    out, err = io.StringIO(), io.StringIO()
+    error = None
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            R.main([kind] + argv)
+    except BaseException as e:          # SystemExit included: report it
+        error = e
+    finally:
+        (R.SerialTransport, R.TcpTransport, R.DaqEControl,
+         R.DaqSensor.read_spectrum) = saved[:4]
+        daq_cal.DeviceCalibration.from_device = saved[4]
+    return out.getvalue(), err.getvalue(), error
+
+
+def test_record_daq_runs():
+    """record_daq.main() end to end against a simulated sensor."""
+    print("\n-- record_daq runs (simulated sensor) --")
+    spec = list((np.random.rand(135) * 5e4 + 100).astype("float32"))
+
+    # STANDBY parks the spectrometer, and nothing on a DAQ-E can wake it:
+    # its firmware bridges TCP 5000 straight to the UART and never drives
+    # the sensor's reset line, so the next run -- ours, Chloros's, even the
+    # unit's own boot check -- gets no answer until the power is pulled
+    # (Jetson rig, 2026-10-16). Chloros never sends it to any DAQ.
+    p = os.path.join(OUT, "rec_u.daq")
+    dev = _RecDev([1, 2, 3, 4, 5], spec)
+    so, _, e = _record("u", ["--port", "FAKE", "--frames", "3",
+                             "--output", p, "--csv"], dev)
+    check("record_daq u completes", e is None, repr(e))
+    check("a clean exit does NOT put the sensor into standby",
+          R.CMD_STANDBY not in dev.sent,
+          "" if R.CMD_STANDBY not in dev.sent else
+          "STANDBY sent: a DAQ-E then answers nothing until power-cycled")
+    rows = list(csv.reader(open(os.path.splitext(p)[0] + ".csv",
+                                newline="", encoding="utf-8")))
+    check("raw CSV names the cap the .daq beside it declares",
+          "cap=sunshine_cosine" in rows[1][0] and "cap=None" not in rows[1][0],
+          rows[1][0])
+    check("the console does not call a RAW CSV calibrated",
+          "calibrated CSV" not in so,
+          next((ln.strip() for ln in so.splitlines() if "CSV" in ln), ""))
+
+    # --calibrate bake --csv: the CSV is "what this run records", and a baked
+    # run records W/m^2/nm -- so the CSV must hold the same numbers as the
+    # .daq beside it, not the raw counts they were computed from.
+    cal = _cal_135()
+    p = os.path.join(OUT, "rec_e_bake.daq")
+    dev = _RecDev([1, 2, 3, 4, 5], spec)
+    _, _, e = _record("e", ["--host", "FAKE", "--frames", "2", "--output", p,
+                            "--calibrate", "bake", "--csv"], dev, cal=cal)
+    check("record_daq e --calibrate bake completes", e is None, repr(e))
+    check("...and a DAQ-E is not put into standby either",
+          R.CMD_STANDBY not in dev.sent)
+    cv = os.path.splitext(p)[0] + ".csv"
+    rows = ([r for r in csv.reader(open(cv, newline="", encoding="utf-8")) if r]
+            if os.path.exists(cv) else [["(no CSV written)"], ["timestamp_utc"], []])
+    check("bake --csv: the CSV says it is calibrated",
+          "calibrated" in rows[0][0] and "RAW" not in rows[0][0], rows[0][0])
+    hdr = next(r for r in rows if r and r[0] == "timestamp_utc")
+    data = rows[rows.index(hdr) + 1] if rows.index(hdr) + 1 < len(rows) else []
+    _, specs = chloros_read_daq(p) if os.path.exists(p) else ({}, [])
+    units = data[hdr.index("units")] if "units" in hdr and data else None
+    check("bake --csv: units are W/m^2/nm", units == "W/m^2/nm", units)
+    vals = np.array([float(v) for v in data[6:]], dtype=np.float64)
+    baked = specs[0][1] if specs else np.zeros(0)
+    same = (len(specs) == 2 and vals.shape == baked.shape
+            and np.allclose(vals, baked, rtol=1e-5, atol=1e-12))
+    check("bake --csv: the CSV holds the .daq's own values", same,
+          "" if same else "CSV and .daq disagree")
+
+    # --duration must end a run whose sensor has gone silent. A timeout used
+    # to `continue` past the duration check, so the run never ended.
+    class _Runaway(Exception):
+        pass
+    t_start = time.monotonic()
+
+    def silent(self):
+        if time.monotonic() - t_start > 5.0:
+            raise _Runaway()
+        time.sleep(0.05)
+        raise TimeoutError("no spectrum returned within timeout")
+
+    p = os.path.join(OUT, "rec_silent.daq")
+    _, _, e = _record("u", ["--port", "FAKE", "--duration", "0.3",
+                            "--output", p], _RecDev([1, 2, 3, 4, 5], spec),
+                      read_spectrum=silent)
+    check("--duration ends a run whose sensor never answers",
+          e is None and time.monotonic() - t_start < 3.0,
+          f"{type(e).__name__} after {time.monotonic() - t_start:.1f}s")
+
+
 # ===========================================================================
 # Part 3 -- LATTICE camera config + capture (fake arena_api device)
 # ===========================================================================
@@ -346,9 +487,40 @@ class _FakeNodemap:
             raise KeyError(name)
         return _FakeNode(self, name)
 
+    def invalidate_nodes(self):
+        self._writes.append(("<INVALIDATE>", None))
+
+
+class _ArmingNodemap(_FakeNodemap):
+    """TriggerArmed reads False ``arm_after`` times, then True. Every read
+    and every TriggerSoftware execute goes into the shared ``log`` as
+    (tag, event), so the order across several cameras can be checked."""
+
+    def __init__(self, vals, arm_after, log, tag):
+        super().__init__(vals, {"Width": 8, "Height": 8})
+        self._left, self._log, self._tag = arm_after, log, tag
+
+    def get_node(self, name):
+        nm = self
+        if name == "TriggerArmed":
+            class _Armed:
+                @property
+                def value(self):
+                    armed = nm._left <= 0
+                    nm._left -= 1
+                    nm._log.append((nm._tag, "armed" if armed else "not-armed"))
+                    return armed
+            return _Armed()
+        if name == "TriggerSoftware":
+            class _Exec:
+                def execute(self):
+                    nm._log.append((nm._tag, "TRIGGER"))
+            return _Exec()
+        return super().get_node(name)
+
 
 class _FakeBuffer:
-    def __init__(self, arr):
+    def __init__(self, arr, chunks=None):
         import ctypes
         self.width = arr.shape[1]
         self.height = arr.shape[0]
@@ -356,13 +528,21 @@ class _FakeBuffer:
         b = arr.astype(np.uint16).tobytes()
         self.pdata = (ctypes.c_ubyte * len(b)).from_buffer_copy(b)
         self.frame_id = 7
+        self._chunks = dict(chunks or {})
+
+    def get_chunk(self, names):
+        class _V:
+            def __init__(self, v): self.value = v
+        if not all(n in self._chunks for n in names):
+            raise ValueError("chunk data not present in this buffer")
+        return {n: _V(self._chunks[n]) for n in names}
 
 
 class _FakeDevice:
-    def __init__(self, nm, arr):
+    def __init__(self, nm, arr, chunks=None):
         self.nodemap = nm
         self.tl_stream_nodemap = _FakeNodemap()
-        self._buf = _FakeBuffer(arr)
+        self._buf = _FakeBuffer(arr, chunks)
 
     def start_stream(self, n): pass
     def stop_stream(self): pass
@@ -467,11 +647,11 @@ def test_camera_capture_flow():
     print("== full capture flow (fake cameras -> TIFF -> Chloros reader) ==")
     img = (np.random.rand(1536, 2048) * 4095).astype(np.uint16)
     nm = _FakeNodemap({"DeviceSerialNumber": "213602328", "DeviceUserID": "M3C-L41-FRGN",
-                       "ExposureTime": 4000.0, "Gain": 0.0},
+                       "ExposureTime": 4000.0, "Gain": 0.0, "TriggerArmed": True},
                       {"Width": 2048, "Height": 1536})
     cam = C.LatticeCamera(_FakeDevice(nm, img))
     cam.identify()
-    arr, fid = cam.grab_raw()
+    arr, info = cam.grab_raw()
     check("buffer_to_numpy shape+dtype", arr.shape == (1536, 2048) and arr.dtype == np.uint16)
     check("buffer_to_numpy pixel-exact", np.array_equal(arr, img))
 
@@ -495,6 +675,84 @@ def test_camera_capture_flow():
               chloros_image_utc_offset(p) == 0.0)
     else:
         skip("capture TIFF EXIF checks", "pip install tifffile")
+
+
+def test_camera_frame_metadata():
+    """Per-frame exposure, and triggering only an armed camera.
+
+    Both measured on the Jetson rig, 2026-10-16. The ExposureTime NODE is a
+    cached GenICam value: under auto-exposure it stayed at 1851 us in every
+    frame's EXIF while the frames were really exposed at 1603 -> 2299 us, and
+    Chloros divides by EXIF exposure, so radiance drifted +44%. Only the
+    frame's own chunk data says what that frame got. Separately, a software
+    trigger sent before TriggerArmed is dropped: one camera in software mode
+    lost every other frame.
+    """
+    print("\n-- per-frame exposure + trigger arming (fake device) --")
+    img = (np.random.rand(8, 8) * 4095).astype(np.uint16)
+    nm = _FakeNodemap({"DeviceSerialNumber": "214000551",
+                       "DeviceUserID": "M3C-L41-FNGB",
+                       "ExposureTime": 1851.4, "Gain": 0.0,    # stale cache
+                       "TriggerArmed": True},
+                      {"Width": 8, "Height": 8})
+    cam = C.LatticeCamera(_FakeDevice(
+        nm, img, chunks={"ChunkExposureTime": 2298.5, "ChunkGain": 6.0}))
+    cam.identify()
+    cam.configure_raw(exposure_us=None)
+    seq = _writes_seq(cam.dev)
+    check("configure_raw turns chunk data on", "ChunkModeActive=True" in seq)
+    for what in ("ExposureTime", "Gain"):
+        i = seq.index(f"ChunkSelector={what}") if f"ChunkSelector={what}" in seq else -1
+        check(f"...with the {what} chunk enabled",
+              i >= 0 and "ChunkEnable=True" in seq[i + 1:i + 2], str(seq[-6:]))
+
+    class _Args:
+        output_dir = os.path.join(OUT, "cam_chunk"); frames = 1; duration = 0
+        interval = 0; timeout_ms = 2000
+    import threading
+    cam.role = "single"
+    C.capture_loop([cam], "software", _Args(), threading.Event())
+    tiffs = [f for f in os.listdir(_Args.output_dir) if f.endswith(".tiff")]
+    if HAVE_TIFFFILE and tiffs:
+        ctx = chloros_exif_context(os.path.join(_Args.output_dir, tiffs[0]))
+        check("EXIF exposure is the FRAME's (chunk), not the cached node",
+              abs(ctx.get("exp_us", 0) - 2298.5) < 1, ctx.get("exp_us"))
+        check("EXIF gain is the FRAME's too (6 dB -> ISO 200)",
+              abs(ctx.get("gain_db", 0) - 6.0) < 0.1, ctx.get("gain_db"))
+    else:
+        skip("per-frame EXIF checks", "pip install tifffile")
+
+    # Software trigger: wait for TriggerArmed, then fire.
+    log = []
+    cam = C.LatticeCamera(_FakeDevice(_ArmingNodemap(
+        {"DeviceSerialNumber": "1", "DeviceUserID": "M3C-L41-FOCN"},
+        3, log, "solo"), img))
+    cam.trigger()
+    fired = [i for i, (_, ev) in enumerate(log) if ev == "TRIGGER"]
+    check("software trigger waits until the camera is armed",
+          len(fired) == 1 and fired[0] > 0 and log[fired[0] - 1][1] == "armed"
+          and ("solo", "not-armed") in log[:fired[0]], str(log))
+
+    # Cable: the master's trigger is what every slave exposes on, so it may
+    # only fire once the SLAVES are armed too, or they miss the edge.
+    log = []
+    master = C.LatticeCamera(_FakeDevice(_ArmingNodemap(
+        {"DeviceSerialNumber": "1", "DeviceUserID": "M3C-L41-FRGB"},
+        0, log, "master"), img))
+    slave = C.LatticeCamera(_FakeDevice(_ArmingNodemap(
+        {"DeviceSerialNumber": "2", "DeviceUserID": "M3C-L41-FRGN"},
+        2, log, "slave"), img))
+    for c in (master, slave):
+        c.identify()
+
+    class _Args2(_Args):
+        output_dir = os.path.join(OUT, "cam_arm")
+    C.capture_loop([master, slave], "cable", _Args2(), threading.Event())
+    fired = [i for i, (t, ev) in enumerate(log) if ev == "TRIGGER"]
+    slave_armed = [i for i, (t, ev) in enumerate(log)
+                   if t == "slave" and ev == "armed"]
+    check("cable: the master fires only after the slave is armed",
+          fired and slave_armed and slave_armed[0] < fired[0], str(log))
 
 
 def test_offline_calibration():
@@ -965,12 +1223,18 @@ def test_stream_recording():
             def close(self): pass
             def recvfrom(self, _n): return payload, ("10.0.0.9", 5002)
         real = ds.socket.socket
+        real_q = getattr(ds, "_query_unit", None)
         ds.socket.socket = lambda *a, **k: _S()
+        ds._query_unit = lambda host, **k: {
+            "name": "daq-e-a1b2c3",
+            "status": {"cap_id": "as_recorded", "profiles_present": False}}
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 ds.main(argv)
         finally:
             ds.socket.socket = real
+            if real_q is not None:
+                ds._query_unit = real_q
 
     for cal in (False, True):
         tag = "cal" if cal else "raw"
@@ -982,7 +1246,12 @@ def test_stream_recording():
 
         meta, specs = chloros_read_daq(dq)
         check(f"{tag} stream -> a .daq Chloros can read",
-              len(specs) == 2 and meta["product_serial"] == "11-22-33-44-55")
+              len(specs) == 2)
+        # The calibration key is the unit's NAME (hello), not the
+        # spectrometer serial the frame carries -- Chloros found no bundle
+        # under the latter on hardware and skipped the recording.
+        check(f"{tag} stream .daq is stamped with the unit name",
+              meta["product_serial"] == "daq-e-a1b2c3", meta["product_serial"])
         # THE labelling property: a calibrated stream that does not declare
         # itself gets its bundle applied a second time at import.
         check(f"{tag} stream .daq declares calibration_applied={int(cal)}",
@@ -1069,13 +1338,17 @@ def test_stream_recording():
                 fr = _frames[min(box["i"], len(_frames) - 1)]
                 box["i"] += 1
                 return fr, ("10.0.0.9", 5004)
-        real = ds.socket.socket
+        real, real_q = ds.socket.socket, getattr(ds, "_query_unit", None)
         ds.socket.socket = lambda *a, **k: _S()
+        ds._query_unit = lambda host, **k: {"name": "daq-e-a1b2c3",
+                                            "status": None}
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 ds.main(argv)
         finally:
             ds.socket.socket = real
+            if real_q is not None:
+                ds._query_unit = real_q
         c = _sq.connect(out)
         ts = [r[0] for r in c.execute("SELECT precise_timestamp FROM als_log "
                                       "WHERE event_type=4 ORDER BY id")]
@@ -1157,6 +1430,172 @@ def test_stream_recording():
         skip("IMU decode matches Chloros field for field", f"import failed: {e}")
     finally:
         sys.path[:] = saved
+
+
+def _v2_frame(serial, mac, *, cal=False, seq=1, n=135):
+    """One v2 spectral datagram (plain DAQ-E, no trailer)."""
+    import daq_stream as ds
+    if cal:
+        payload = struct.pack("<%df" % n, *[0.02] * n)
+        flags = 0x02 | 0x08
+    else:
+        payload = (b"\x03\xbb\x28\x00" + struct.pack("<H", 50) + b"\x00\x00"
+                   + struct.pack("<I", n) + struct.pack("<%df" % n, *[100.0] * n))
+        flags = 0x02
+    d = bytearray(32)
+    d[0:2] = b"\xda\x0e"; d[2] = 2; d[3] = flags
+    struct.pack_into("<I", d, 4, seq)
+    struct.pack_into("<Q", d, 8, 1_752_600_000_000_000 + seq * 400_000)
+    d[16:22] = mac
+    d[22:27] = serial
+    d[27] = 0                                   # daq-e
+    struct.pack_into("<H", d, 28, 50)
+    struct.pack_into("<H", d, 30, len(payload))
+    d += payload
+    d += struct.pack("<H", ds._crc16_ccitt(bytes(d)))
+    return bytes(d)
+
+
+def test_stream_identity():
+    """What daq_stream --daq stamps: whose recording it is, and which cap.
+
+    On hardware (2026-10-16) a raw stream .daq stamped with the frame's
+    spectrometer serial was skipped by Chloros -- "no calibration bundle for
+    daq-e CB-7C-A8-12-43" -- while record_daq's recording of the same unit,
+    stamped with the unit's hello name, calibrated. And the calibrated stream
+    carried the device's sunshine profile while the file said as_recorded /
+    not applied, which invites a second cap on top.
+    """
+    print("\n-- daq_stream --daq identity + cap (simulated units) --")
+    import daq_stream as ds
+    A = (b"\x11\x22\x33\x44\x55", b"\xaa\xbb\xcc\xdd\xee\x01")
+    B = (b"\x66\x77\x88\x99\xaa", b"\xaa\xbb\xcc\xdd\xee\x02")
+
+    def run(argv, frames, query):
+        calls = []
+
+        def q(host, **k):
+            calls.append((host, k))
+            r = query(host, **k)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        box = {"i": 0}
+
+        class _S:
+            def setsockopt(self, *a): pass
+            def setblocking(self, *a): pass
+            def settimeout(self, *a): pass
+            def bind(self, *a): pass
+            def close(self): pass
+            def recvfrom(self, _n):
+                fr, ip = frames[box["i"] % len(frames)]
+                box["i"] += 1
+                return fr, (ip, 5002)
+        real, real_q = ds.socket.socket, getattr(ds, "_query_unit", None)
+        ds.socket.socket = lambda *a, **k: _S()
+        ds._query_unit = q
+        out, err, error = io.StringIO(), io.StringIO(), None
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                ds.main(argv)
+        except BaseException as e:
+            error = e
+        finally:
+            ds.socket.socket = real
+            if real_q is not None:
+                ds._query_unit = real_q
+        return calls, out.getvalue() + err.getvalue(), error
+
+    def daq(name):
+        return os.path.join(OUT, name)
+
+    named = lambda host, **k: {"name": "daq-e-a1b2c3", "status": None}
+    raw_a = [(_v2_frame(*A, seq=i), "10.0.0.9") for i in range(1, 5)]
+
+    p = daq("ident_raw.daq")
+    calls, _, e = run(["--count", "3", "--daq", p, "--quiet",
+                       "--duration", "5"], raw_a, named)
+    meta, specs = chloros_read_daq(p) if os.path.exists(p) else ({}, [])
+    check("raw stream .daq carries the unit name Chloros keys on",
+          e is None and meta.get("product_serial") == "daq-e-a1b2c3",
+          f"{meta.get('product_serial')!r} {e!r}")
+    check("...asked of the unit that sent the frames",
+          bool(calls) and calls[0][0] == "10.0.0.9", str(calls[:1]))
+
+    p = daq("ident_named.daq")
+    calls, _, e = run(["--count", "2", "--daq", p, "--quiet", "--duration",
+                       "5", "--unit-name", "daq-e-fffff0"], raw_a, named)
+    meta, _ = chloros_read_daq(p) if os.path.exists(p) else ({}, [])
+    check("--unit-name stamps that name without asking the unit",
+          e is None and meta.get("product_serial") == "daq-e-fffff0"
+          and not calls, f"{meta.get('product_serial')!r} calls={len(calls)} {e!r}")
+
+    p = daq("ident_unreachable.daq")
+    cv = daq("ident_unreachable.csv")
+    calls, said, e = run(["--count", "3", "--daq", p, "--csv", cv, "--quiet",
+                          "--duration", "5"], raw_a,
+                         lambda host, **k: OSError("connection refused"))
+    check("a unit that cannot be asked gets NO .daq under a guessed serial",
+          e is None and not os.path.exists(p), f"exists={os.path.exists(p)} {e!r}")
+    check("...says how to record anyway (--unit-name)", "--unit-name" in said,
+          said.strip().splitlines()[-1] if said.strip() else "(silent)")
+    check("...and asks only once, not on every frame", len(calls) == 1,
+          f"{len(calls)} queries")
+    check("...while the CSV still records", os.path.exists(cv)
+          and sum(1 for _ in open(cv)) >= 5)
+
+    cal_a = [(_v2_frame(*A, cal=True, seq=i), "10.0.0.9") for i in range(1, 5)]
+    for status, want_cap, want_applied, label in (
+            ({"cap_id": "sunshine_cosine", "profiles_present": True},
+             "sunshine_cosine", 1, "a device carrying the sunshine profile"),
+            ({"cap_id": "sunshine_cosine", "profiles_present": False},
+             "as_recorded", 0, "a device carrying no profile")):
+        p = daq("ident_cal_%d.daq" % want_applied)
+        _, _, e = run(["--calibrated", "--count", "2", "--daq", p, "--quiet",
+                       "--duration", "5"], cal_a,
+                      lambda host, s=status, **k: {"name": "daq-e-a1b2c3",
+                                                   "status": s})
+        meta, _ = chloros_read_daq(p) if os.path.exists(p) else ({}, [])
+        got = (meta.get("cap_id"), int(bool(meta.get("cap_applied"))),
+               meta.get("cap_id_source"))
+        check(f"calibrated .daq from {label} declares what it folded in",
+              e is None and got == (want_cap, want_applied, "device"),
+              f"got {got} {e!r}")
+
+    p = daq("ident_cal_op.daq")
+    _, _, e = run(["--calibrated", "--count", "2", "--daq", p, "--quiet",
+                   "--duration", "5", "--cap-id", "fov_45"], cal_a,
+                  lambda host, **k: {"name": "daq-e-a1b2c3", "status": None})
+    meta, _ = chloros_read_daq(p) if os.path.exists(p) else ({}, [])
+    got = (meta.get("cap_id"), int(bool(meta.get("cap_applied"))),
+           meta.get("cap_id_source"))
+    check("--cap-id on a calibrated stream is recorded as the operator's",
+          e is None and got == ("fov_45", 1, "operator"), f"got {got} {e!r}")
+
+    p = daq("ident_cal_nostatus.daq")
+    _, said, e = run(["--calibrated", "--count", "2", "--daq", p, "--quiet",
+                      "--duration", "5"], cal_a,
+                     lambda host, **k: PermissionError("auth_failed"))
+    check("calibrated stream with no way to learn the cap: no .daq, and why",
+          e is None and not os.path.exists(p) and "--cap-id" in said,
+          f"exists={os.path.exists(p)}")
+
+    # Two units on one group: one .daq is ONE unit's recording.
+    mixed = []
+    for i in range(1, 5):
+        mixed.append((_v2_frame(*A, seq=i), "10.0.0.9"))
+        mixed.append((_v2_frame(*B, seq=i), "10.0.0.10"))
+    p = daq("ident_mixed.daq")
+    _, said, e = run(["--count", "8", "--daq", p, "--quiet", "--duration", "5"],
+                     mixed, named)
+    meta, specs = chloros_read_daq(p) if os.path.exists(p) else ({}, [])
+    check("a .daq holds only the unit that opened it",
+          e is None and len(specs) == 4, f"{len(specs)} readings from 8 frames")
+    check("...and says the other unit was left out",
+          "66-77-88-99-AA" in said and "--serial" in said,
+          said.strip().splitlines()[-1] if said.strip() else "(silent)")
 
 
 def test_export_round_trip():
@@ -1542,13 +1981,16 @@ def test_multicast_stream():
 def main():
     test_metadata_contract()
     test_wire_codec()
+    test_record_daq_runs()
     test_camera_config()
     test_cable_sync_ordering()
     test_camera_capture_flow()
+    test_camera_frame_metadata()
     test_offline_calibration()
     test_cap_declaration()
     test_set_device_cap()
     test_stream_recording()
+    test_stream_identity()
     test_export_round_trip()
     test_multicast_stream()
     n = sum(RESULTS)

@@ -417,7 +417,31 @@ def _csv_cell(v):
     return v
 
 
-def _open_daq(args, frame):
+def _query_unit(host, *, port=5001, token="", want_status=False,
+                timeout=3.0):
+    """Ask a DAQ-E over its control channel (TCP 5001) for the name its
+    calibration is filed under, and -- for a calibrated stream -- its status,
+    which says which cap profile it folds in.
+
+    ``hello`` needs no token; ``status`` does on a provisioned unit.
+    Returns ``{"name": str, "status": dict or None}``; raises on failure.
+    """
+    from daq_cal import DaqEControlClient   # numpy; only --daq needs this
+    with DaqEControlClient(host, port=port, timeout=timeout,
+                           token=token) as c:
+        name = str(c.cmd({"cmd": "hello"}).get("name") or "").strip()
+        if not name:
+            raise RuntimeError("its hello carried no name")
+        status = None
+        if want_status:
+            status = c.cmd({"cmd": "status"})
+            if not status.get("ok", True):
+                raise PermissionError(status.get("code")
+                                      or status.get("error") or "refused")
+    return {"name": name, "status": status}
+
+
+def _open_daq(args, frame, src_ip):
     """Open the .daq once the first frame has told us what to declare.
 
     The stream's OWN calibrated flag decides ``calibration_applied`` -- not
@@ -425,6 +449,13 @@ def _open_daq(args, frame):
     calibrated recording and being calibrated a second time at import, which
     would square the correction silently, so it is taken from the data rather
     than from an argument.
+
+    The serial stamped is the unit's NAME (its ``hello`` name, e.g.
+    daq-e-54b774), the key Chloros fetches a DAQ-E's calibration under and
+    the one record_daq.py stamps -- not the spectrometer serial the frame
+    carries, under which Chloros found no bundle and skipped the recording
+    (Jetson rig, 2026-10-16). Returns (None, None) when that name, or for a
+    calibrated stream the cap, cannot be had; nothing is guessed.
     """
     from mapir_metadata import DaqWriter
 
@@ -440,21 +471,63 @@ def _open_daq(args, frame):
               "record_daq.py over the raw TCP channel.",
               file=sys.stderr, flush=True)
         return None, None
+
+    need_status = calibrated and not args.cap_id
+    name, status = args.unit_name, None
+    if not name or need_status:
+        try:
+            got = _query_unit(src_ip, port=args.control_port,
+                              token=args.token, want_status=need_status)
+        except Exception as e:  # noqa: BLE001 -- any failure: say so, stop
+            if need_status and not args.unit_name:
+                what = "its unit name and cap profile"
+            elif need_status:
+                what = "which cap profile it folds into the calibrated stream"
+            else:
+                what = "its unit name"
+            print(f"! --daq: could not ask {src_ip} for {what} "
+                  f"({type(e).__name__}: {e}). Nothing is recorded to "
+                  f"{args.daq} rather than a guess. Chloros files a DAQ-E's "
+                  f"calibration under its name; pass --unit-name (the "
+                  f"'sensor' line of `daq_cal.py {src_ip}`)"
+                  + (", and --cap-id (its 'cap' line) or --token for a "
+                     "provisioned unit," if need_status else "")
+                  + " to record without asking. The CSV is unaffected.",
+                  file=sys.stderr, flush=True)
+            return None, None
+        name = name or got["name"]
+        status = got.get("status")
+
     kwargs = {}
     if calibrated:
+        if args.cap_id:
+            # The operator says which profile the device folded in.
+            cap, cap_source = args.cap_id, "operator"
+        elif status.get("profiles_present") and status.get("cap_id"):
+            # What the unit itself reports applying. The calibrated stream
+            # matches daq_cal + that profile to float rounding on hardware.
+            cap, cap_source = status["cap_id"], "device"
+        else:
+            # No profile aboard: the device applied none.
+            cap, cap_source = "as_recorded", "device"
         # The device folded in its own bundle. We do not have that bundle's
         # sha from the wire -- the datagram carries no provenance -- so say
         # so explicitly rather than inventing one. DaqWriter demands a sha
         # for a calibrated recording precisely so this cannot pass silently.
         kwargs = dict(
             calibration_applied=True,
-            calibration_bundle_sha="device:" + (serial or "unknown"),
+            calibration_bundle_sha="device:" + name,
             calibration_completed_utc="",
-            cap_id=args.cap_id,
-            cap_id_source="device",
-            cap_applied=(args.cap_id not in (None, "", "as_recorded")),
+            cap_id=cap,
+            cap_id_source=cap_source,
+            # as_recorded is "no per-wavelength profile": stamping it applied
+            # would make Chloros refuse a later operator override.
+            cap_applied=(cap != "as_recorded"),
         )
-    w = DaqWriter(args.daq, product_model=model, product_serial=serial,
+    elif args.cap_id and not args.imu:
+        # Raw spectra: nothing applied; this DECLARES the cap for Chloros.
+        kwargs = dict(cap_id=args.cap_id)
+    w = DaqWriter(args.daq, product_model=model, product_serial=name,
                   device_name=frame.get("mac") or "", **kwargs)
     _what = ("ATTITUDE" if args.imu else
              "CALIBRATED" if calibrated else "RAW")
@@ -505,12 +578,23 @@ def main(argv=None):
                    help="with --daq: override the product_model "
                         "stamped (daq-e / daq-e-s). Default: whatever "
                         "the frames report, which v2 always does.")
-    p.add_argument("--cap-id", metavar="CAP_ID", default="as_recorded",
-                   help="with --daq on a CALIBRATED stream: which cap the "
-                        "device folded in, for the file to declare. Read it "
-                        "off the unit with daq_cal.py. Default "
-                        "'as_recorded' -- the device applied whatever it "
-                        "holds and this script is not guessing which.")
+    p.add_argument("--cap-id", metavar="CAP_ID", default=None,
+                   help="with --daq: on a CALIBRATED stream, which cap "
+                        "profile the device folded in; on a raw stream, which "
+                        "cap is fitted, for Chloros to apply. Default: on a "
+                        "calibrated stream, asked of the unit (its status "
+                        "names the profile it applies); on a raw stream, the "
+                        "cap the model ships wearing, recorded as assumed.")
+    p.add_argument("--unit-name", metavar="NAME",
+                   help="with --daq: the unit name its calibration is filed "
+                        "under (daq-e-XXXXXX, the 'sensor' line of "
+                        "daq_cal.py). Default: asked of the unit over its "
+                        "control channel, once.")
+    p.add_argument("--control-port", type=int, default=5001,
+                   help="DAQ-E JSON control TCP port, for --daq (default 5001)")
+    p.add_argument("--token", default="",
+                   help="DAQ-E control-channel token, for --daq on a "
+                        "provisioned unit (its status needs it)")
     p.add_argument("--count", type=int, default=0, help="stop after N frames")
     p.add_argument("--duration", type=float, default=0.0,
                    help="stop after N seconds")
@@ -564,6 +648,9 @@ def main(argv=None):
 
     daq_writer = None
     daq_path = None
+    daq_key = None          # the unit this .daq belongs to
+    daq_gave_up = False     # _open_daq refused once: do not ask every frame
+    daq_others = set()      # other units heard, already warned about
     # Attitude thinning. Gated on each sample's OWN timestamp rather than
     # a keep-every-Nth counter: the device's rate is nominal, not
     # guaranteed, so a counter would silently change the output rate
@@ -661,45 +748,61 @@ def main(argv=None):
                      len(f["spectrum"])]
                     + ["%.6g" % v for v in f["spectrum"]])
 
-            # --- .daq: attitude ------------------------------------------
-            if args.daq and args.imu:
-                if daq_writer is None:
-                    daq_writer, daq_path = _open_daq(args, f)
-                if daq_writer is not None:
-                    daq_writer.write_attitude(
-                        f,
-                        timestamp_ns=(f["timestamp_us"] * 1000
-                                      if f["absolute_time"]
-                                      else time.time_ns()),
-                        device_timestamp_ns=(f["timestamp_us"] * 1000
-                                             if f["absolute_time"] else None),
-                        device_ts_ptp=f["ptp_synced"])
-
-            # --- .daq ---------------------------------------------------
+            # --- .daq: which frames go in ----------------------------------
             # Opened on the FIRST frame, not up front: the model and serial
             # it has to declare come off the wire, and a v1 unit reports
-            # neither. Opening early would mean inventing them.
-            if args.daq and not args.imu and f["spectrum"] is not None:
+            # neither. Opening early would mean inventing them. A .daq is ONE
+            # unit's recording -- it carries one serial and one calibration
+            # -- so frames from any other unit on the group stay out of it.
+            to_daq = False
+            if (args.daq and not daq_gave_up
+                    and (args.imu or f["spectrum"] is not None)):
                 if daq_writer is None:
-                    daq_writer, daq_path = _open_daq(args, f)
+                    daq_writer, daq_path = _open_daq(args, f, addr[0])
+                    daq_key = key
+                    daq_gave_up = daq_writer is None
                 if daq_writer is not None:
-                    daq_writer.write(
-                        f["spectrum"], f["saturated"],
-                        f["integration_time_ms"] or 0,
-                        # The sensor latches timestamp_us as its own last
-                        # byte arrives, so it beats host arrival time -- but
-                        # only when it is an absolute epoch. A free-running
-                        # boot counter would look absolute and drag the file
-                        # onto a nonsense axis, so hand it over only when the
-                        # frame says it is real and let DaqWriter refuse the
-                        # rest.
-                        timestamp_ns=(f["timestamp_us"] * 1000
-                                      if f["absolute_time"]
-                                      else time.time_ns()),
-                        device_timestamp_ns=(f["timestamp_us"] * 1000
-                                             if f["absolute_time"] else None),
-                        device_ts_ptp=f["ptp_synced"],
-                        imu=f.get("imu"))
+                    if key == daq_key:
+                        to_daq = True
+                    elif key not in daq_others:
+                        daq_others.add(key)
+                        print(f"! --daq records one unit per file: "
+                              f"{daq_path} holds {daq_key}; frames from "
+                              f"{key} ({addr[0]}) are not in it. Use "
+                              f"--serial to pick the unit, or run one "
+                              f"daq_stream.py per unit.",
+                              file=sys.stderr, flush=True)
+
+            # --- .daq: attitude ------------------------------------------
+            if to_daq and args.imu:
+                daq_writer.write_attitude(
+                    f,
+                    timestamp_ns=(f["timestamp_us"] * 1000
+                                  if f["absolute_time"]
+                                  else time.time_ns()),
+                    device_timestamp_ns=(f["timestamp_us"] * 1000
+                                         if f["absolute_time"] else None),
+                    device_ts_ptp=f["ptp_synced"])
+
+            # --- .daq: spectra -------------------------------------------
+            if to_daq and not args.imu:
+                daq_writer.write(
+                    f["spectrum"], f["saturated"],
+                    f["integration_time_ms"] or 0,
+                    # The sensor latches timestamp_us as its own last
+                    # byte arrives, so it beats host arrival time -- but
+                    # only when it is an absolute epoch. A free-running
+                    # boot counter would look absolute and drag the file
+                    # onto a nonsense axis, so hand it over only when the
+                    # frame says it is real and let DaqWriter refuse the
+                    # rest.
+                    timestamp_ns=(f["timestamp_us"] * 1000
+                                  if f["absolute_time"]
+                                  else time.time_ns()),
+                    device_timestamp_ns=(f["timestamp_us"] * 1000
+                                         if f["absolute_time"] else None),
+                    device_ts_ptp=f["ptp_synced"],
+                    imu=f.get("imu"))
 
             if not args.quiet and st.frames % 20 == 1:
                 peak = max(f["spectrum"]) if f["spectrum"] else float("nan")
@@ -736,6 +839,8 @@ def main(argv=None):
         _kind = "attitude sample(s)" if args.imu else "reading(s)"
         print(f"DAQ: {daq_path}  ({_n} {_kind}"
               + ("" if args.imu else f", cap={daq_writer.cap_id}") + ")")
+    elif args.daq and daq_gave_up:
+        print("DAQ: nothing written -- see the message above.")
     elif args.daq:
         print("DAQ: nothing written -- no %s arrived."
               % ("attitude samples" if args.imu else "spectral frames"))

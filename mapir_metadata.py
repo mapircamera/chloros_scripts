@@ -491,6 +491,7 @@ class DaqWriter:
         # a recorder that resolves a default silently is hiding the single
         # most consequential thing in the file.
         self._cap_id = cap_id
+        self._cap_id_source = cap_id_source
         if not str(product_serial).strip():
             raise ValueError(
                 "product_serial is required -- it is the calibration fetch "
@@ -669,6 +670,12 @@ class DaqWriter:
     def cap_id(self):
         """The cap id actually stamped, after the model default resolved."""
         return self._cap_id
+
+    @property
+    def cap_id_source(self):
+        """Who decided that cap (auto_default / operator / device / model),
+        as stamped."""
+        return self._cap_id_source
 
     @property
     def record_count(self):

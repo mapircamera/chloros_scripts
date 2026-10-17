@@ -105,6 +105,7 @@ def _frame(code, user=0, payload=b""):
 
 
 def cmd_hello():   return _frame(CMD_HELLO)
+# Part of the protocol, deliberately never sent: see DaqSensor.close().
 def cmd_standby(): return _frame(CMD_STANDBY)
 def cmd_get_id():  return _frame(CMD_GET_ID)
 def cmd_get_wl():  return _frame(CMD_GET_WL)
@@ -426,13 +427,13 @@ class DaqSensor:
             raise TimeoutError("no spectrum returned within timeout")
         return parse_spectrum(pkt)
 
-    def standby_and_close(self):
-        # Graceful shutdown: ask the sensor to stand by, then close the link.
-        try:
-            self.t.send(cmd_standby())
-            time.sleep(0.1)
-        except Exception:
-            pass
+    def close(self):
+        # Close the link and leave the sensor AWAKE. Never send STANDBY here:
+        # on a DAQ-E nothing can wake the sensor again. The firmware bridges
+        # this socket straight to the sensor's UART and never drives its
+        # reset line, so the next client -- this script, Chloros, even the
+        # unit's own health check after a reboot -- gets no answer until the
+        # power is pulled. Chloros never sends it to any DAQ, so neither do we.
         try:
             self.t.close()
         except Exception:
@@ -519,8 +520,10 @@ def main(argv=None):
                         "Default 'off' (raw only).")
     p.add_argument("--csv", metavar="PATH", nargs="?", const=True,
                    help="also write a CSV of what this run records -- "
-                        "calibrated W/m^2/nm with --calibrate csv, otherwise "
-                        "the same RAW counts that go into the .daq. Bare "
+                        "calibrated W/m^2/nm with --calibrate csv or bake "
+                        "(for bake, the very numbers the .daq holds), "
+                        "otherwise the same RAW counts that go into the "
+                        ".daq. Bare "
                         "--csv puts it beside the .daq; give a PATH to place "
                         "it. Raw CSV is the only CSV a DAQ-U or DAQ-M can "
                         "produce, since neither carries a bundle to "
@@ -678,8 +681,11 @@ def main(argv=None):
     # orders of magnitude and nothing about the numbers announces which you
     # are holding.
     want_csv = args.csv or args.calibrate == "csv"
+    # Whenever this run calibrates (csv or bake), the CSV carries the
+    # calibrated numbers: for bake they are what the .daq holds, so a raw CSV
+    # beside a calibrated .daq would describe a different recording.
+    csv_calibrated = cal is not None
     if want_csv:
-        csv_calibrated = (args.calibrate == "csv")
         # Bare --csv (argparse const=True) means "beside the .daq".
         csv_path = (args.csv if isinstance(args.csv, str)
                     else os.path.splitext(out)[0] + ".csv")
@@ -688,9 +694,13 @@ def main(argv=None):
         if csv_calibrated:
             csv_out.writerow([f"# MAPIR {kind} calibrated spectral irradiance "
                               f"(W/m^2/nm)"])
+            # The cap actually handed to apply() below: an --cap-id
+            # as_recorded override skips the device's profile, and the
+            # header has to say so rather than name the profile it carries.
             csv_out.writerow([f"# sensor={serial_id} "
                               f"bundle_sha={cal.bundle_sha} "
-                              f"completed={cal.completed_utc} cap={cal.cap_id} "
+                              f"completed={cal.completed_utc} "
+                              f"cap={args.cap_id or cal.cap_id} "
                               f"dark_model={cal.dark_model} "
                               f"profiles={cal.profiles_source}"])
         else:
@@ -698,9 +708,10 @@ def main(argv=None):
                               f"(NOT irradiance)"])
             # The cap is provenance for the .daq beside this file, not
             # something applied to these numbers -- say so, so nobody reads
-            # the column as already-corrected.
+            # the column as already-corrected. Quoted from the writer, which
+            # holds the default it resolved, so the two files agree.
             csv_out.writerow([f"# sensor={serial_id} uncalibrated; "
-                              f"cap={cap_stamp} ({cap_source or 'assumed'}) "
+                              f"cap={writer.cap_id} ({writer.cap_id_source}) "
                               f"is DECLARED for Chloros to apply, not applied "
                               f"here"])
         # Wavelength headers come from the bundle. A raw run has no
@@ -743,7 +754,8 @@ def main(argv=None):
                 "    import. Pass --cap-id sunshine_cosine if it is fitted."):
             print(_line, file=sys.stderr, flush=True)
     if csv_path:
-        print(f"  calibrated CSV: {os.path.abspath(csv_path)}")
+        _what = "calibrated W/m^2/nm" if csv_calibrated else "RAW counts"
+        print(f"  CSV ({_what}): {os.path.abspath(csv_path)}")
     if baking:
         print("  (.daq carries calibrated W/m^2/nm; Chloros will import "
               "as-is, not re-calibrate)")
@@ -756,6 +768,11 @@ def main(argv=None):
     n = 0
     try:
         while not stop.is_set():
+            # Checked before every read, not only after a good one: a sensor
+            # that has stopped answering returns nothing but timeouts, and a
+            # run that only counted successes would never reach its end.
+            if args.duration and (time.monotonic() - t0) >= args.duration:
+                break
             try:
                 spec, inttime, sat = sensor.read_spectrum()
             except TimeoutError as e:
@@ -797,13 +814,11 @@ def main(argv=None):
                 print(f"  {n} readings ...", flush=True)
             if args.frames and n >= args.frames:
                 break
-            if args.duration and (time.monotonic() - t0) >= args.duration:
-                break
     finally:
         writer.close()
         if csv_fh is not None:
             csv_fh.close()
-        sensor.standby_and_close()
+        sensor.close()
         print(f"Stopped. Wrote {n} readings to {os.path.abspath(out)}")
         if csv_path:
             print(f"                    and {os.path.abspath(csv_path)}")

@@ -77,6 +77,7 @@ class LatticeCamera:
         self.model = None       # "LATT-M3C-L41-FRGN"
         self.is_mono = None
         self.role = None        # 'master' / 'slave' / 'single'
+        self._warned_no_chunks = False
 
     # -- node helpers --
     def _set(self, name, value):
@@ -156,6 +157,22 @@ class LatticeCamera:
             self._try_set("ExposureAuto", "Off")
             self._set("ExposureTime", float(exposure_us))
         self._try_set("AcquisitionMode", "Continuous")
+        self.enable_frame_chunks()
+
+    def enable_frame_chunks(self):
+        """Have the camera attach each frame's OWN exposure and gain to it
+        (GenICam chunk data), for the EXIF Chloros calibrates from.
+
+        The ExposureTime node is no substitute: GenICam serves a node's
+        cached value, so under auto-exposure every frame's EXIF said 1851 us
+        while the frames were really exposed at 1603 -> 2299 us (Jetson rig,
+        2026-10-16) -- and radiance is counts divided by that exposure. Must
+        run before streaming starts, since it changes the payload size.
+        """
+        self._try_set("ChunkModeActive", True)
+        for what in ("ExposureTime", "Gain"):
+            if self._try_set("ChunkSelector", what):
+                self._try_set("ChunkEnable", True)
 
     # -- hardware cable sync --------------------------------------------------
     # The master is software-triggered; each trigger drives an ExposureActive
@@ -196,7 +213,27 @@ class LatticeCamera:
         self._set("TriggerMode", "On")
         self._set("TriggerSource", "Software")
 
-    def trigger(self):
+    def wait_armed(self, timeout_s=2.0):
+        """Wait until the camera reports TriggerArmed.
+
+        A trigger that arrives before then is DROPPED, not queued: one camera
+        in software mode lost every other frame this way (Jetson rig,
+        2026-10-16). Returns False on timeout, or at once on firmware without
+        the node; the caller triggers anyway and the grab reports any loss.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                if self._get("TriggerArmed"):
+                    return True
+            except Exception:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+
+    def trigger(self, timeout_s=2.0):
+        self.wait_armed(timeout_s)
         self._exec("TriggerSoftware")
 
     # -- streaming + grab --
@@ -219,29 +256,57 @@ class LatticeCamera:
         except Exception:
             pass
 
-    def frame_exposure_iso(self):
-        """Read the exposure (s) + an ISO equivalent for EXIF. With auto
-        exposure this is the current node value (<= 1 frame stale)."""
-        exp_us, iso = 5000.0, 100
-        try:
-            exp_us = float(self._get("ExposureTime"))
-        except Exception:
-            pass
-        try:
-            gain_db = float(self._get("Gain"))
-            iso = max(1, int(round(100 * (10 ** (gain_db / 20.0)))))
-        except Exception:
-            pass
+    def frame_exposure_iso(self, info=None):
+        """Exposure (s) + an ISO equivalent for EXIF, for ONE frame.
+
+        Taken from the frame's own chunk data (``info``, from grab_raw)
+        whenever the camera attached it. Otherwise the live nodes, re-read
+        from the camera rather than GenICam's cache -- and say so once,
+        because under auto-exposure a live read can already describe the
+        NEXT frame.
+        """
+        info = info or {}
+        exp_us, gain_db = info.get("exposure_us"), info.get("gain_db")
+        if exp_us is None or gain_db is None:
+            if not self._warned_no_chunks:
+                self._warned_no_chunks = True
+                print(f"  [{self.serial}] note: no chunk data on this frame; "
+                      f"EXIF exposure/gain read live from the camera (may be "
+                      f"one auto-exposure step off)", flush=True)
+            try:
+                self.dev.nodemap.invalidate_nodes()
+            except Exception:
+                pass
+            if exp_us is None:
+                try:
+                    exp_us = float(self._get("ExposureTime"))
+                except Exception:
+                    exp_us = 5000.0
+            if gain_db is None:
+                try:
+                    gain_db = float(self._get("Gain"))
+                except Exception:
+                    gain_db = 0.0
+        iso = max(1, int(round(100 * (10 ** (gain_db / 20.0)))))
         return exp_us / 1e6, iso
 
     def grab_raw(self, timeout_ms=2000):
+        """Return (frame, info): the raw plane, and this frame's frame_id plus
+        -- when chunk data is on -- its own exposure_us and gain_db."""
         buf = self.dev.get_buffer(timeout=timeout_ms)
         try:
             arr = buffer_to_numpy(buf)
-            frame_id = getattr(buf, "frame_id", None)
+            info = {"frame_id": getattr(buf, "frame_id", None)}
+            try:
+                # Read before requeue: the chunk lives in this buffer.
+                ch = buf.get_chunk(["ChunkExposureTime", "ChunkGain"])
+                info["exposure_us"] = float(ch["ChunkExposureTime"].value)
+                info["gain_db"] = float(ch["ChunkGain"].value)
+            except Exception:
+                pass
         finally:
             self.dev.requeue_buffer(buf)
-        return arr, frame_id
+        return arr, info
 
 
 # ---------------------------------------------------------------------------
@@ -318,22 +383,27 @@ def capture_loop(ordered_cams, mode, args, stop):
     t0 = time.monotonic()
     seq = 1
     saved = 0
+    arm_s = args.timeout_ms / 1000.0
     try:
         while not stop.is_set():
             shot_time = datetime.now(timezone.utc)
             if mode == "cable":
-                ordered_cams[0].trigger()            # master drives the array
+                # Every slave exposes on the master's pulse, so each must be
+                # armed before the master fires or it misses the edge.
+                for c in ordered_cams[1:]:
+                    c.wait_armed(arm_s)
+                ordered_cams[0].trigger(arm_s)       # master drives the array
             else:
                 for c in ordered_cams:
-                    c.trigger()
+                    c.trigger(arm_s)
             for c in ordered_cams:
                 try:
-                    arr, _ = c.grab_raw(timeout_ms=args.timeout_ms)
+                    arr, info = c.grab_raw(timeout_ms=args.timeout_ms)
                 except Exception as e:
                     print(f"  ! {c.serial}: grab failed ({e})", file=sys.stderr,
                           flush=True)
                     continue
-                exp_s, iso = c.frame_exposure_iso()
+                exp_s, iso = c.frame_exposure_iso(info)
                 fn = lattice_capture_filename(c.serial, seq, when=shot_time)
                 write_lattice_raw_tiff(os.path.join(out_dir, fn), arr,
                                        model=c.model, serial=c.serial,
