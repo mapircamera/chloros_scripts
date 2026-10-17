@@ -14,6 +14,9 @@ _selftest_out/
 *.daq
 !docs/**/*.tif
 
+# Arena SDK writes this into the working directory
+persist.json
+
 # OS / editor
 .DS_Store
 Thumbs.db

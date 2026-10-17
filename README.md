@@ -57,6 +57,8 @@ own — install the native Arena SDK for your platform first (Windows, and Linux
 x86-64 / arm64 including Jetson and Raspberry Pi builds), then its Python
 package. Put the host NIC on the cameras' subnet and enable jumbo frames if your
 switch supports them. `record_daq.py` does **not** need the Arena SDK.
+The Arena SDK writes a small `persist.json` into the directory you run from;
+it is harmless (and ignored by this repo's `.gitignore`).
 
 ## Hardware requirements
 
@@ -120,6 +122,14 @@ rig. (Syncing cameras that *aren't* cabled together, or measuring the exact
 skew, is what PTP is for; that's not implemented here.) Frames are saved
 uncompressed (~6.3 MB each) so the required EXIF survives; Chloros debayers and
 calibrates on import.
+
+**Exposure is recorded per frame.** Each TIFF's EXIF exposure and gain come
+from that frame's own chunk data, which the script switches on
+(`ChunkModeActive`). The camera's `ExposureTime` setting is no substitute: it
+is a cached value that does not follow auto-exposure, and Chloros divides by
+the EXIF exposure, so a stale one is a radiance error of the same size. Every
+software trigger also waits for the camera to report `TriggerArmed` (in cable
+mode, every slave too): a trigger sent before that is dropped, not queued.
 
 ## Usage — `record_daq.py`
 
@@ -258,7 +268,7 @@ revised bundle. Prefer it for anything you intend to keep.
 | Raw, unicast | TCP `5000` | raw counts, **one client at a time** | ✅ `record_daq.py` |
 | Raw, multicast | UDP `239.10.10.10:5002` | raw counts, any number of listeners | ✅ `daq_stream.py` |
 | Calibrated, multicast | UDP `239.10.10.11:5003` | W/m²/nm, when the device carries coefficients | ✅ `daq_stream.py --calibrated` |
-| Control | TCP `5001` | JSON: config, status, bundle/profile/cert | ✅ `daq_cal.py` |
+| Control | TCP `5001` | JSON: config, status, bundle/profile/cert | ✅ `daq_cal.py`; `daq_stream.py --daq` (`hello` / `status` only) |
 
 Full datagram layout in [`PROTOCOL.md`](https://github.com/mapircamera/ESP32/blob/main/PROTOCOL.md).
 
@@ -309,6 +319,20 @@ Multicast, so any number of consumers can read the same sensor and any number
 of sensors can share a group. The TCP raw channel `record_daq.py` uses is
 exclusive — one client — so this is the path for multi-sensor work and for
 running alongside Chloros.
+
+**Recording to `.daq`.** `--daq` writes one unit per file: the first unit
+heard opens it, and frames from any other unit on the group are left out,
+with a warning. Pick one with `--serial`, or run one `daq_stream.py` per unit.
+The file is stamped with the unit's name (`daq-e-XXXXXX`), the key Chloros
+fetches a DAQ-E's calibration under; the script asks the unit for it once,
+over its control channel (TCP 5001, `hello`). The serial inside the frames is
+the spectrometer's own, and no calibration is filed under it. If the unit
+cannot be asked (TCP blocked between you and it, say), nothing is written to
+the `.daq` rather than a guess, while the CSV keeps recording; pass
+`--unit-name` (the `sensor` line of `daq_cal.py <host>`) to record without
+asking. With `--calibrated` the file also declares the cap profile the device
+folded in, read from the unit's `status` (pass `--token` for a provisioned
+unit), or as stated with `--cap-id`.
 
 **Sensor separation.** Datagram v2 (firmware 1.7.0+) carries the sender's MAC,
 serial, model and per-frame integration time, so frames are self-describing and
@@ -373,7 +397,7 @@ python daq_cal.py 192.168.1.50
 |---------------|-----------------|-------------|
 | `off` (default) | raw counts | **Recommended.** Chloros calibrates at import and writes the `.csv` for you |
 | `csv` | raw counts, **plus** a calibrated `.csv` | you need numbers in the field, with no Chloros and no internet |
-| `bake` | calibrated W/m²/nm, stamped with the bundle SHA | the recording must stand completely alone |
+| `bake` | calibrated W/m²/nm, stamped with the bundle SHA (`--csv` writes the same numbers) | the recording must stand completely alone |
 
 Prefer a raw `.daq` over `bake` in every case where you have a choice. A raw
 recording can be re-calibrated later if a coefficient revision lands; a baked
@@ -571,6 +595,11 @@ between 1 and 500 ms and the dark model is a function of it.
 
 - **DAQ-E** uses the JSON control channel (TCP 5001) to read the serial and the
   raw spectral channel (TCP 5000) to acquire; timestamps are host wall-clock.
+- **The scripts never put a sensor into standby**, and if you adapt them, don't
+  add one. A DAQ-E cannot wake its spectrometer again: the firmware passes TCP
+  5000 straight to the sensor and never drives its reset line, so the next
+  client (this script, Chloros, the unit's own check after a reboot) gets no
+  answer until the unit is power-cycled.
 - **Multi-camera sync** is hardware, over the M8 sync cables — the master drives
   the array off one trigger line for sub-frame simultaneous exposure. (Syncing
   cameras that aren't cabled into a single chain is outside the scope of these
