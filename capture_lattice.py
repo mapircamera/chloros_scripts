@@ -35,6 +35,7 @@ Examples
 """
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -47,6 +48,15 @@ import numpy as np
 from mapir_metadata import lattice_capture_filename, write_lattice_raw_tiff
 
 SYNC_LINE = "Line2"  # MAPIR M8 sync cable: pin 2 (brown) = Line2 on every cam
+
+# Slave trigger-input deglitch, microseconds -- the same filter Chloros
+# applies (lattice_cam/multi.py). See LatticeCamera.configure_slave.
+TRIGGER_DEGLITCH_US = 5.0
+
+
+class IncompleteFrame(Exception):
+    """A frame arrived with packets missing. It is never written: on a
+    shared 1 GbE link a third of such a frame's rows came back zero."""
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +196,7 @@ class LatticeCamera:
         self._set("LineMode", "Output")
         self._set("LineSource", "ExposureActive")
 
-    def configure_slave(self, line=SYNC_LINE):
+    def configure_slave(self, line=SYNC_LINE, deglitch_us=TRIGGER_DEGLITCH_US):
         self.role = "slave"
         # IMPORTANT ordering / firmware quirks (observed on some camera firmware):
         #  1. TriggerMode must be Off while we rewrite the trigger wiring --
@@ -197,10 +207,23 @@ class LatticeCamera:
         #  3. A slave with LineSource=Off goes DEAF to the cable pulse even
         #     with LineMode=Input -- the input sensing path must be "biased"
         #     with a non-Off LineSource. Set it to ExposureActive explicitly.
+        #  4. Deglitch the trigger input. The shared M8 line chatters while
+        #     the master holds it, and an unfiltered slave fires on every
+        #     glitch: one delivered 10 frames in 5 s with no trigger sent,
+        #     and the extra frames flooded a 1 GbE link (Jetson rig,
+        #     2026-10-19). Chloros applies the same filter; 5 us is ~10x the
+        #     chatter and far shorter than any real exposure pulse. The
+        #     firmware only takes it on an input, so it follows LineMode.
         self._set("TriggerMode", "Off")
         self._set("LineSelector", line)
         self._set("LineMode", "Input")
         self._set("LineSource", "ExposureActive")     # bias quirk (#3)
+        if deglitch_us and deglitch_us > 0:           # (#4)
+            if not (self._try_set("LineFilterSelector", "Deglitch")
+                    and self._try_set("LineFilterWidth", float(deglitch_us))):
+                print(f"  [{self.serial}] note: no trigger-input deglitch on "
+                      f"this firmware; the slave may fire on M8 line chatter",
+                      flush=True)
         self._set("TriggerSource", line)
         self._set("TriggerActivation", "RisingEdge")
         self._try_set("TriggerOverlap", "PreviousFrame")
@@ -292,8 +315,17 @@ class LatticeCamera:
 
     def grab_raw(self, timeout_ms=2000):
         """Return (frame, info): the raw plane, and this frame's frame_id plus
-        -- when chunk data is on -- its own exposure_us and gain_db."""
+        -- when chunk data is on -- its own exposure_us and gain_db.
+
+        Raises IncompleteFrame, after requeueing the buffer, when packets
+        were lost: the SDK still hands such a frame over, with the missing
+        rows left zero, and a raw capture must never save it as good data.
+        """
         buf = self.dev.get_buffer(timeout=timeout_ms)
+        if getattr(buf, "is_incomplete", False):
+            frame_id = getattr(buf, "frame_id", None)
+            self.dev.requeue_buffer(buf)
+            raise IncompleteFrame(f"frame {frame_id}: packets lost in transit")
         try:
             arr = buffer_to_numpy(buf)
             info = {"frame_id": getattr(buf, "frame_id", None)}
@@ -307,6 +339,19 @@ class LatticeCamera:
         finally:
             self.dev.requeue_buffer(buf)
         return arr, info
+
+    def discard_pending(self, timeout_ms=2000):
+        """Throw away a frame that may still arrive for a shot we gave up on.
+
+        A trigger whose reply was lost may still have fired. Left in the
+        queue, that frame would be grabbed by the NEXT shot and saved under
+        its timestamp, and every shot after it would be off by one.
+        """
+        try:
+            self.dev.requeue_buffer(self.dev.get_buffer(timeout=timeout_ms))
+            return True
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +391,7 @@ def open_cameras(system, wanted_serials=None, model_fallback=None):
 # ---------------------------------------------------------------------------
 # Capture orchestration
 # ---------------------------------------------------------------------------
-def assign_roles(cams, sync, master_serial):
+def assign_roles(cams, sync, master_serial, deglitch_us=TRIGGER_DEGLITCH_US):
     """Return (ordered_cams, mode) and apply the sync wiring. ordered_cams has
     the master first so we trigger it before grabbing the array."""
     if sync == "cable" and len(cams) > 1:
@@ -363,7 +408,7 @@ def assign_roles(cams, sync, master_serial):
         slaves = [c for c in cams if c is not master]
         master.configure_master()
         for s in slaves:
-            s.configure_slave()
+            s.configure_slave(deglitch_us=deglitch_us)
         return [master] + slaves, "cable"
     # software / single
     for c in cams:
@@ -375,7 +420,84 @@ def assign_roles(cams, sync, master_serial):
     return cams, "software"
 
 
+def auto_stagger_ms(cams, margin=1.12, efficiency=0.94):
+    """Per-camera transmission stagger (ms) for cameras sharing one link.
+
+    Several cameras that send their frames at the same moment collide in the
+    switch: on a 1 GbE uplink about half the packets were lost and every
+    frame arrived incomplete, at any DeviceLinkThroughputLimit (Jetson rig,
+    2026-10-19). Holding camera i's frame back by i x (one frame's wire
+    time) sends them one after another while the exposures stay
+    simultaneous. One frame's wire time is PayloadSize over the camera's
+    link speed; ~55 ms was the measured edge for a full-res 12-bit frame at
+    1 GbE, and this returns ~60.
+
+    The camera only knows its own (1 GbE) link, not the host's uplink, so
+    this assumes the shared-1 GbE worst case. Behind a 10 GbE uplink pass
+    --stagger-ms 0 for full speed. 0 for a single camera.
+    """
+    if len(cams) < 2:
+        return 0
+    wire_s = 0.0
+    for c in cams:
+        try:
+            payload = float(c._get("PayloadSize"))
+        except Exception:
+            payload = 2048 * 1536 * 2
+        try:
+            link = float(c._get("DeviceLinkSpeed"))   # bytes/s
+        except Exception:
+            link = 125e6
+        wire_s = max(wire_s, payload / (link * efficiency))
+    return int(math.ceil(wire_s * margin * 1000))
+
+
+def configure_stagger(ordered_cams, stagger_ms):
+    """GevSCFTD: camera i holds each finished frame i x stagger_ms before
+    sending it. Set on every camera, 0 included, so a delay left behind by
+    another program cannot slow or skew this run."""
+    for i, c in enumerate(ordered_cams):
+        c._try_set("GevSCFTD", int(round(i * stagger_ms * 1e6)))
+
+
+def _fire(ordered_cams, mode, arm_s, timeout_ms):
+    """Trigger one shot; return the cameras that should now deliver a frame.
+
+    A trigger whose control packet is lost raises (SC_ERR_TIMEOUT on a
+    congested link). That costs the shot, not the run -- but the command
+    may still have reached the camera, so its frame is drained rather than
+    left to be grabbed as the next shot's.
+    """
+    if mode == "cable":
+        # Every slave exposes on the master's pulse, so each must be
+        # armed before the master fires or it misses the edge.
+        for c in ordered_cams[1:]:
+            c.wait_armed(arm_s)
+        try:
+            ordered_cams[0].trigger(arm_s)           # master drives the array
+            return list(ordered_cams)
+        except Exception as e:
+            print(f"  ! {ordered_cams[0].serial}: trigger failed ({e}); shot "
+                  f"skipped", file=sys.stderr, flush=True)
+            for c in ordered_cams:
+                c.discard_pending(timeout_ms)
+            return []
+    fired = []
+    for c in ordered_cams:
+        try:
+            c.trigger(arm_s)
+            fired.append(c)
+        except Exception as e:
+            print(f"  ! {c.serial}: trigger failed ({e}); frame skipped",
+                  file=sys.stderr, flush=True)
+            c.discard_pending(timeout_ms)
+    return fired
+
+
 def capture_loop(ordered_cams, mode, args, stop):
+    """Capture until frames / duration / Ctrl-C. Returns {"shots", "saved",
+    "lost"}: lost counts frames that were not saved -- incomplete, timed
+    out, or never triggered."""
     out_dir = args.output_dir or "."
     os.makedirs(out_dir, exist_ok=True)
     for c in ordered_cams:
@@ -383,25 +505,27 @@ def capture_loop(ordered_cams, mode, args, stop):
     t0 = time.monotonic()
     seq = 1
     saved = 0
+    lost = 0
     arm_s = args.timeout_ms / 1000.0
     try:
         while not stop.is_set():
             shot_time = datetime.now(timezone.utc)
-            if mode == "cable":
-                # Every slave exposes on the master's pulse, so each must be
-                # armed before the master fires or it misses the edge.
-                for c in ordered_cams[1:]:
-                    c.wait_armed(arm_s)
-                ordered_cams[0].trigger(arm_s)       # master drives the array
-            else:
-                for c in ordered_cams:
-                    c.trigger(arm_s)
+            fired = _fire(ordered_cams, mode, arm_s, args.timeout_ms)
             for c in ordered_cams:
+                if c not in fired:
+                    lost += 1
+                    continue
                 try:
                     arr, info = c.grab_raw(timeout_ms=args.timeout_ms)
+                except IncompleteFrame as e:
+                    print(f"  ! {c.serial}: shot {seq} incomplete ({e}); not "
+                          f"saved", file=sys.stderr, flush=True)
+                    lost += 1
+                    continue
                 except Exception as e:
                     print(f"  ! {c.serial}: grab failed ({e})", file=sys.stderr,
                           flush=True)
+                    lost += 1
                     continue
                 exp_s, iso = c.frame_exposure_iso(info)
                 fn = lattice_capture_filename(c.serial, seq, when=shot_time)
@@ -426,6 +550,11 @@ def capture_loop(ordered_cams, mode, args, stop):
             c.stop()
         print(f"Stopped. Saved {saved} frames across {seq - 1} shots to "
               f"{os.path.abspath(out_dir)}")
+        if lost:
+            print(f"  ! {lost} frame(s) NOT saved (incomplete, timed out or "
+                  f"not triggered). Several cameras on one 1 GbE link need "
+                  f"--stagger-ms; see the README.", file=sys.stderr, flush=True)
+    return {"shots": seq - 1, "saved": saved, "lost": lost}
 
 
 def main(argv=None):
@@ -454,6 +583,18 @@ def main(argv=None):
                    help="seconds between shots (0 = as fast as possible)")
     p.add_argument("--timeout-ms", type=int, default=2000,
                    help="per-frame grab timeout in ms (default 2000)")
+    p.add_argument("--stagger-ms", type=float, default=None,
+                   help="hold camera i's frame back i x this many ms before "
+                        "sending it, so frames cross a shared link one at a "
+                        "time while exposures stay simultaneous. Default: "
+                        "one frame's wire time at 1 GbE (~60 ms full-res "
+                        "12-bit) with 2+ cameras -- needed on a shared 1 GbE "
+                        "switch/uplink; pass 0 behind a 10 GbE uplink for "
+                        "full speed")
+    p.add_argument("--deglitch-us", type=float, default=TRIGGER_DEGLITCH_US,
+                   help="cable sync: slave trigger-input deglitch in "
+                        f"microseconds (default {TRIGGER_DEGLITCH_US:g}, as "
+                        "Chloros uses; 0 leaves the camera's own setting)")
     p.add_argument("--output-dir", help="where to write TIFFs (default: .)")
     args = p.parse_args(argv)
 
@@ -469,19 +610,29 @@ def main(argv=None):
     for c in cams:
         c.configure_raw(exposure_us=args.exposure_us)
 
-    ordered, mode = assign_roles(cams, args.sync, args.master)
+    ordered, mode = assign_roles(cams, args.sync, args.master,
+                                 deglitch_us=args.deglitch_us)
     print(f"Sync mode: {mode}"
           + (f" (master {ordered[0].serial})" if mode == "cable" else ""))
+    stagger = (args.stagger_ms if args.stagger_ms is not None
+               else auto_stagger_ms(ordered))
+    configure_stagger(ordered, stagger)
+    if len(ordered) > 1:
+        print(f"Transmission stagger: {stagger:g} ms per camera"
+              + (" (auto, for a shared 1 GbE link; --stagger-ms 0 behind a "
+                 "10 GbE uplink)" if args.stagger_ms is None else ""))
     print("Recording RAW. Chloros will calibrate by serial at import. Ctrl-C to stop.",
           flush=True)
     try:
-        capture_loop(ordered, mode, args, stop)
+        result = capture_loop(ordered, mode, args, stop)
     finally:
         try:
             system.destroy_device()
         except Exception:
             pass
-    return 0
+    # Non-zero when any frame was lost, so a script driving this one can
+    # tell a complete capture from a partial one.
+    return 1 if result["lost"] else 0
 
 
 if __name__ == "__main__":

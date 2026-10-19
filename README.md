@@ -102,6 +102,9 @@ python capture_lattice.py --sync cable --master 213602328 --interval 1.0
 
 # fixed 5 ms exposure, run until Ctrl-C
 python capture_lattice.py --exposure-us 5000
+
+# an array behind a 10 GbE uplink: frames need not take turns
+python capture_lattice.py --stagger-ms 0
 ```
 
 | Option | Meaning | Default |
@@ -112,6 +115,8 @@ python capture_lattice.py --exposure-us 5000
 | `--model STR` | model to fall back to when a camera's `DeviceUserID` is empty (factory reset) | read from the camera |
 | `--exposure-us N` | fixed exposure (µs) | auto-exposure |
 | `--frames N` / `--duration S` / `--interval S` | stop after N shots / S seconds / wait S between shots | until Ctrl-C |
+| `--stagger-ms MS` | camera *i* sends each frame *i* × MS after exposing (see below) | one frame's 1 GbE wire time (~60 ms full-res 12-bit) with 2+ cameras |
+| `--deglitch-us US` | cable sync: slave trigger-input deglitch | `5` |
 | `--output-dir DIR` | where to write TIFFs | `.` |
 
 **Hardware sync.** With `--sync cable`, the master camera is software-triggered
@@ -130,6 +135,34 @@ is a cached value that does not follow auto-exposure, and Chloros divides by
 the EXIF exposure, so a stale one is a radiance error of the same size. Every
 software trigger also waits for the camera to report `TriggerArmed` (in cable
 mode, every slave too): a trigger sent before that is dropped, not queued.
+
+**Several cameras on one 1 GbE link** — a switch into a Jetson's built-in
+port, say — have to take turns. Frames sent at the same moment collide in the
+switch: about half the packets are lost and every frame arrives incomplete,
+whatever per-camera throughput limit is set. So with two or more cameras the
+script holds camera *i*'s finished frame back *i* × `--stagger-ms` before
+sending it (GigE Vision `GevSCFTD`). The exposures stay simultaneous; only the
+transfers queue up. The default is one full frame's wire time at 1 GbE, about
+60 ms for a full-resolution 12-bit frame. Behind a 10 GbE uplink, pass
+`--stagger-ms 0` for full speed.
+
+**An incomplete frame is never saved.** If packets are lost anyway, that frame
+is dropped and named on stderr, the summary counts it, and the script exits
+with status 1. It is not written as a TIFF: a partial frame has rows of zeros
+that would otherwise reach Chloros as data.
+
+**Slaves are deglitched.** The shared M8 line chatters while the master holds
+it, and an unfiltered slave fires on every glitch, producing frames nobody
+triggered. Each slave's trigger input gets the same 5 µs filter Chloros uses
+(`--deglitch-us`).
+
+Measured on a Jetson Orin NX through a 1 GbE switch (MTU 9000), raw 12-bit
+full resolution, writing TIFFs to NVMe:
+
+| Cameras | Rate |
+|---|---|
+| 1 | ~11 frames/s |
+| 4, cable sync | ~2.5 shots/s (~10 frames/s); ~3.4 shots/s is the link's limit at this stagger, so faster storage helps |
 
 ## Usage — `record_daq.py`
 

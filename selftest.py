@@ -755,6 +755,112 @@ def test_camera_frame_metadata():
           fired and slave_armed and slave_armed[0] < fired[0], str(log))
 
 
+def test_shared_link():
+    """Several cameras on one shared 1 GbE link (Jetson rig, 2026-10-19).
+
+    Frames sent at the same moment collide in the switch: about half the
+    packets were lost, every multi-camera frame arrived incomplete, and the
+    script saved them as ordinary TIFFs with a third of their rows zero.
+    Staggering each camera's frame TRANSMISSION (GevSCFTD) fixed it while
+    the exposures stayed simultaneous. Cable sync additionally needed the
+    slave trigger-input deglitch Chloros applies (lattice_cam/multi.py):
+    without it the slaves fired on M8 line chatter. And a trigger whose
+    control packet was lost raised out of the loop and ended the run.
+    """
+    print("\n-- shared 1 GbE link: incomplete frames, stagger, deglitch --")
+    import threading
+    img = (np.random.rand(8, 8) * 4095).astype(np.uint16)
+
+    class _Args:
+        frames = 1; duration = 0; interval = 0; timeout_ms = 500
+
+    # 1. An incomplete buffer is never written.
+    nm = _FakeNodemap({"DeviceSerialNumber": "214000551",
+                       "DeviceUserID": "M3C-L41-FNGB", "TriggerArmed": True},
+                      {"Width": 8, "Height": 8})
+    dev = _FakeDevice(nm, img, chunks={"ChunkExposureTime": 1000.0,
+                                       "ChunkGain": 0.0})
+    dev._buf.is_incomplete = True
+    cam = C.LatticeCamera(dev); cam.identify(); cam.role = "single"
+    args = _Args(); args.output_dir = os.path.join(OUT, "cam_partial")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        res = C.capture_loop([cam], "software", args, threading.Event())
+    written = [f for f in os.listdir(args.output_dir) if f.endswith(".tiff")]
+    check("an incomplete frame is NOT saved as a TIFF", written == [],
+          f"{len(written)} written" if written else "")
+    check("...and the run says it lost it", "incomplete" in out.getvalue(),
+          out.getvalue().strip().splitlines()[-1] if out.getvalue().strip() else "(silent)")
+    check("...and reports the loss to its caller",
+          isinstance(res, dict) and res.get("lost") == 1, repr(res))
+
+    # 2. Slave deglitch, where Chloros puts it: after the LineSource bias,
+    #    before TriggerSource.
+    nm = _FakeNodemap({"DeviceSerialNumber": "2", "DeviceUserID": "M3C-L41-FRGN"}, {})
+    slave = C.LatticeCamera(_FakeDevice(nm, img))
+    slave.configure_slave()
+    seq = _writes_seq(slave.dev)
+    def at(w): return seq.index(w) if w in seq else -1
+    check("slave trigger input is deglitched (5 us)",
+          at("LineFilterSelector=Deglitch") >= 0 and at("LineFilterWidth=5.0") >= 0,
+          str([w for w in seq if w.startswith("LineFilter")]))
+    check("...after the LineSource bias and before TriggerSource",
+          at("LineSource=ExposureActive") < at("LineFilterSelector=Deglitch")
+          < at("LineFilterWidth=5.0") < at("TriggerSource=Line2"), str(seq))
+    check("slave still armed last", seq[-1] == "TriggerMode=On")
+
+    # 3. Transmission stagger: camera i holds its frame i x stagger.
+    cams = []
+    for i in range(4):
+        nm = _FakeNodemap({"DeviceSerialNumber": str(10 + i), "DeviceUserID": "M3C-L41-FRGN",
+                           "PayloadSize": 2048 * 1536 * 2 + 64,
+                           "DeviceLinkSpeed": 125_000_000}, {})
+        cams.append(C.LatticeCamera(_FakeDevice(nm, img)))
+    try:
+        auto = C.auto_stagger_ms(cams)
+        C.configure_stagger(cams, auto)
+        ftd = [dict(c.dev.nodemap._writes).get("GevSCFTD") for c in cams]
+        ok = (55 <= auto <= 65 and ftd == [int(i * auto * 1e6) for i in range(4)])
+        detail = f"auto {auto} ms -> GevSCFTD {ftd}"
+    except Exception as e:
+        ok, detail = False, f"{type(e).__name__}: {e}"
+    check("4 cameras on 1 GbE: transmissions staggered one frame's wire time apart",
+          ok, detail)
+    try:
+        one = C.auto_stagger_ms(cams[:1])
+        ok, detail = one == 0, f"auto {one} ms"
+    except Exception as e:
+        ok, detail = False, f"{type(e).__name__}: {e}"
+    check("a single camera is not delayed", ok, detail)
+
+    # 4. A trigger whose control packet is lost does not end the run.
+    class _FlakyNodemap(_FakeNodemap):
+        fails = 1
+        def get_node(self, name):
+            if name == "TriggerSoftware" and self.fails > 0:
+                self.fails -= 1
+                raise TimeoutError("SC_ERR_TIMEOUT -1011")
+            return super().get_node(name)
+    nm = _FlakyNodemap({"DeviceSerialNumber": "214000535", "DeviceUserID": "M3C-L41-FRGB",
+                        "TriggerArmed": True}, {"Width": 8, "Height": 8})
+    cam = C.LatticeCamera(_FakeDevice(nm, img, chunks={"ChunkExposureTime": 1000.0,
+                                                       "ChunkGain": 0.0}))
+    cam.identify(); cam.role = "single"
+    args = _Args(); args.frames = 2; args.output_dir = os.path.join(OUT, "cam_flaky")
+    out, err = io.StringIO(), None
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            res = C.capture_loop([cam], "software", args, threading.Event())
+    except Exception as e:
+        err, res = e, None
+    written = [f for f in os.listdir(args.output_dir) if f.endswith(".tiff")] \
+        if os.path.isdir(args.output_dir) else []
+    check("a lost trigger does not end the run", err is None, repr(err))
+    check("...the shot is reported lost and the next one is saved",
+          len(written) == 1 and isinstance(res, dict) and res.get("lost") == 1,
+          f"{len(written)} written, {res!r}")
+
+
 def test_offline_calibration():
     """daq_cal: the transform applied straight off the DAQ-E's onboard bundle.
 
@@ -1986,6 +2092,7 @@ def main():
     test_cable_sync_ordering()
     test_camera_capture_flow()
     test_camera_frame_metadata()
+    test_shared_link()
     test_offline_calibration()
     test_cap_declaration()
     test_set_device_cap()
