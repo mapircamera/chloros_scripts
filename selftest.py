@@ -1168,11 +1168,15 @@ def test_shared_link():
         auto = C.auto_stagger_ms(cams)
         C.configure_stagger(cams, auto)
         ftd = [dict(c.dev.nodemap._writes).get("GevSCFTD") for c in cams]
-        ok = (55 <= auto <= 65 and ftd == [int(i * auto * 1e6) for i in range(4)])
+        # 65 ms for a full-res 12-bit frame at 1 GbE. Measured edges: 55 ms
+        # was clean through a jumbo-frame switch but lost frames on a no-jumbo
+        # PoE path (1500-byte packets), where 60 was the first clean value
+        # -- so the default sits a step above both (Jetson rig, 2026-10-19).
+        ok = (auto == 65 and ftd == [int(i * auto * 1e6) for i in range(4)])
         detail = f"auto {auto} ms -> GevSCFTD {ftd}"
     except Exception as e:
         ok, detail = False, f"{type(e).__name__}: {e}"
-    check("4 cameras on 1 GbE: transmissions staggered one frame's wire time apart",
+    check("4 cameras on 1 GbE: transmissions staggered 65 ms apart (no-jumbo margin)",
           ok, detail)
     try:
         one = C.auto_stagger_ms(cams[:1])

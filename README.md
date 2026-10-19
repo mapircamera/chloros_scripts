@@ -115,7 +115,7 @@ python capture_lattice.py --stagger-ms 0
 | `--model STR` | model to fall back to when a camera's `DeviceUserID` is empty (factory reset) | read from the camera |
 | `--exposure-us N` | fixed exposure (µs) | auto-exposure |
 | `--frames N` / `--duration S` / `--interval S` | stop after N shots / S seconds / wait S between shots | until Ctrl-C |
-| `--stagger-ms MS` | camera *i* sends each frame *i* × MS after exposing (see below) | one frame's 1 GbE wire time (~60 ms full-res 12-bit) with 2+ cameras |
+| `--stagger-ms MS` | camera *i* sends each frame *i* × MS after exposing (see below) | one frame's 1 GbE wire time plus margin (65 ms full-res 12-bit) with 2+ cameras |
 | `--deglitch-us US` | cable sync: slave trigger-input deglitch | `5` |
 | `--output-dir DIR` | where to write TIFFs | `.` |
 
@@ -142,9 +142,11 @@ switch: about half the packets are lost and every frame arrives incomplete,
 whatever per-camera throughput limit is set. So with two or more cameras the
 script holds camera *i*'s finished frame back *i* × `--stagger-ms` before
 sending it (GigE Vision `GevSCFTD`). The exposures stay simultaneous; only the
-transfers queue up. The default is one full frame's wire time at 1 GbE, about
-60 ms for a full-resolution 12-bit frame. Behind a 10 GbE uplink, pass
-`--stagger-ms 0` for full speed.
+transfers queue up. The default is one full frame's wire time at 1 GbE plus a
+margin: 65 ms for a full-resolution 12-bit frame. That clears both the 55 ms
+measured through a jumbo-frame switch and the 60 ms needed without jumbo frames
+(1500-byte packets, e.g. PoE injectors and splitters with no switch). Behind a
+10 GbE uplink, pass `--stagger-ms 0` for full speed.
 
 **An incomplete frame is never saved.** If packets are lost anyway, that frame
 is dropped and named on stderr, the summary counts it, and the script exits
@@ -156,13 +158,20 @@ it, and an unfiltered slave fires on every glitch, producing frames nobody
 triggered. Each slave's trigger input gets the same 5 µs filter Chloros uses
 (`--deglitch-us`).
 
-Measured on a Jetson Orin NX through a 1 GbE switch (MTU 9000), raw 12-bit
-full resolution, writing TIFFs to NVMe:
+Measured on a Jetson Orin NX, raw 12-bit full resolution, writing TIFFs to
+NVMe. With cable sync all cameras expose together, so the rate is the same
+for each camera:
 
-| Cameras | Rate |
-|---|---|
-| 1 | ~11 frames/s |
-| 4, cable sync | ~2.5 shots/s (~10 frames/s); ~3.4 shots/s is the link's limit at this stagger, so faster storage helps |
+| Network | Cameras | Rate per camera |
+|---|---|---|
+| 1 GbE jumbo-frame switch | 1 | ~11 fps |
+| 1 GbE jumbo-frame switch | 4, cable sync | ~2.5 fps |
+| PoE injector + splitter, no switch, no jumbo | 1 | ~9.6 fps |
+| PoE injector + splitter, no switch, no jumbo | 3, cable sync | ~4 fps |
+
+These are with the disk otherwise idle. TIFF writing shares the disk, and when
+other jobs were writing heavily the same three cameras dropped to ~2.5 fps,
+with no frames lost. Keep the capture disk to yourself, and fast.
 
 ## Usage — `record_daq.py`
 

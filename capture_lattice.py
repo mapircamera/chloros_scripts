@@ -420,7 +420,7 @@ def assign_roles(cams, sync, master_serial, deglitch_us=TRIGGER_DEGLITCH_US):
     return cams, "software"
 
 
-def auto_stagger_ms(cams, margin=1.12, efficiency=0.94):
+def auto_stagger_ms(cams, margin=1.21, efficiency=0.94):
     """Per-camera transmission stagger (ms) for cameras sharing one link.
 
     Several cameras that send their frames at the same moment collide in the
@@ -429,8 +429,10 @@ def auto_stagger_ms(cams, margin=1.12, efficiency=0.94):
     2026-10-19). Holding camera i's frame back by i x (one frame's wire
     time) sends them one after another while the exposures stay
     simultaneous. One frame's wire time is PayloadSize over the camera's
-    link speed; ~55 ms was the measured edge for a full-res 12-bit frame at
-    1 GbE, and this returns ~60.
+    link speed. For a full-res 12-bit frame at 1 GbE the measured edge was
+    55 ms through a jumbo-frame switch but 60 ms on a no-jumbo PoE path
+    (1500-byte packets), so the margin puts the default a step above both:
+    65 ms.
 
     The camera only knows its own (1 GbE) link, not the host's uplink, so
     this assumes the shared-1 GbE worst case. Behind a 10 GbE uplink pass
@@ -587,7 +589,7 @@ def main(argv=None):
                    help="hold camera i's frame back i x this many ms before "
                         "sending it, so frames cross a shared link one at a "
                         "time while exposures stay simultaneous. Default: "
-                        "one frame's wire time at 1 GbE (~60 ms full-res "
+                        "one frame's wire time at 1 GbE plus margin (65 ms full-res "
                         "12-bit) with 2+ cameras -- needed on a shared 1 GbE "
                         "switch/uplink; pass 0 behind a 10 GbE uplink for "
                         "full speed")
