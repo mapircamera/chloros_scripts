@@ -441,8 +441,8 @@ def _query_unit(host, *, port=5001, token="", want_status=False,
     return {"name": name, "status": status}
 
 
-def _open_daq(args, frame, src_ip):
-    """Open the .daq once the first frame has told us what to declare.
+def _open_daq(args, frame, src_ip, say=print):
+    """Decide the .daq once the first frame has told us what to declare.
 
     The stream's OWN calibrated flag decides ``calibration_applied`` -- not
     which group was joined. That flag is the only thing standing between a
@@ -454,9 +454,14 @@ def _open_daq(args, frame, src_ip):
     daq-e-54b774), the key Chloros fetches a DAQ-E's calibration under and
     the one record_daq.py stamps -- not the spectrometer serial the frame
     carries, under which Chloros found no bundle and skipped the recording
-    (Jetson rig, 2026-10-16). Returns (None, None) when that name, or for a
+    (Jetson rig, 2026-10-16).
+
+    Returns (make, path): make() creates the DaqWriter. main() runs it on its
+    writer thread, because creating the file is a disk flush, and that must
+    not happen in the receive loop. (None, None) when the name, or for a
     calibrated stream the cap, cannot be had; nothing is guessed.
     """
+    import functools
     from mapir_metadata import DaqWriter
 
     # An attitude-only recording carries no spectra at all, so
@@ -466,10 +471,10 @@ def _open_daq(args, frame, src_ip):
     model = args.serial_model or frame.get("model") or "daq-e"
     serial = frame.get("sensor_serial")
     if not serial:
-        print("! --daq needs the sensor serial, which v1 frames do not carry "
-              "(firmware < 1.7.0). Nothing recorded; update the unit or use "
-              "record_daq.py over the raw TCP channel.",
-              file=sys.stderr, flush=True)
+        say("! --daq needs the sensor serial, which v1 frames do not carry "
+            "(firmware < 1.7.0). Nothing recorded; update the unit or use "
+            "record_daq.py over the raw TCP channel.",
+            file=sys.stderr, flush=True)
         return None, None
 
     need_status = calibrated and not args.cap_id
@@ -485,15 +490,15 @@ def _open_daq(args, frame, src_ip):
                 what = "which cap profile it folds into the calibrated stream"
             else:
                 what = "its unit name"
-            print(f"! --daq: could not ask {src_ip} for {what} "
-                  f"({type(e).__name__}: {e}). Nothing is recorded to "
-                  f"{args.daq} rather than a guess. Chloros files a DAQ-E's "
-                  f"calibration under its name; pass --unit-name (the "
-                  f"'sensor' line of `daq_cal.py {src_ip}`)"
-                  + (", and --cap-id (its 'cap' line) or --token for a "
+            say(f"! --daq: could not ask {src_ip} for {what} "
+                f"({type(e).__name__}: {e}). Nothing is recorded to "
+                f"{args.daq} rather than a guess. Chloros files a DAQ-E's "
+                f"calibration under its name; pass --unit-name (the "
+                f"'sensor' line of `daq_cal.py {src_ip}`)"
+                + (", and --cap-id (its 'cap' line) or --token for a "
                      "provisioned unit," if need_status else "")
-                  + " to record without asking. The CSV is unaffected.",
-                  file=sys.stderr, flush=True)
+                + " to record without asking. The CSV is unaffected.",
+                file=sys.stderr, flush=True)
             return None, None
         name = name or got["name"]
         status = got.get("status")
@@ -527,12 +532,14 @@ def _open_daq(args, frame, src_ip):
     elif args.cap_id and not args.imu:
         # Raw spectra: nothing applied; this DECLARES the cap for Chloros.
         kwargs = dict(cap_id=args.cap_id)
-    w = DaqWriter(args.daq, product_model=model, product_serial=name,
-                  device_name=frame.get("mac") or "", **kwargs)
+    # commit_every=0: main()'s write-behind thread does the commits.
+    make = functools.partial(
+        DaqWriter, args.daq, product_model=model, product_serial=name,
+        device_name=frame.get("mac") or "", commit_every=0, **kwargs)
     _what = ("ATTITUDE" if args.imu else
              "CALIBRATED" if calibrated else "RAW")
-    print(f"  recording {_what} frames to {args.daq}", flush=True)
-    return w, args.daq
+    say(f"  recording {_what} frames to {args.daq}", flush=True)
+    return make, args.daq
 
 
 def main(argv=None):
@@ -659,6 +666,47 @@ def main(argv=None):
     imu_last_us = None
     imu_dropped = 0
 
+    # One frame's rows, CSV and .daq, written on a thread of their own. On a
+    # disk the cameras are writing to, one .daq commit took 37 s and a plain
+    # write 3 s (Jetson rig, 2026-10-19). Done in this loop, the socket would
+    # overflow and frames without a device clock would be stamped late.
+    def _open(make):
+        nonlocal daq_writer
+        daq_writer = make()
+
+    def _store(csv_row, daq_call):
+        if csv_row is not None:
+            csv_out.writerow(csv_row)
+        if daq_call is not None:
+            method, a, kw = daq_call
+            getattr(daq_writer, method)(*a, **kw)
+
+    def _commit():
+        if daq_writer is not None:
+            daq_writer.commit()
+        if csv_fh is not None:
+            csv_fh.flush()
+
+    def _close_files():
+        try:
+            if daq_writer is not None:
+                daq_writer.close()
+        finally:
+            if csv_fh is not None:
+                csv_fh.close()
+
+    files = None
+    say = print
+    if args.csv or args.daq:
+        # numpy + Pillow; plain listening does not need them.
+        from mapir_metadata import PrintBehind, WriteBehind
+        files = WriteBehind(commit=_commit, close=_close_files,
+                            name="stream-writer")
+        # The loop's own lines too: stdout in a file on that disk blocks
+        # the same way.
+        say = PrintBehind()
+    stalled = 0             # frames dropped in the current overflow
+
     n = 0
     t0 = time.monotonic()
     bad = 0
@@ -671,6 +719,10 @@ def main(argv=None):
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
                 continue
+            # Host arrival time, for frames without a device clock: taken
+            # here, before anything below (opening the .daq is a disk flush)
+            # can delay it.
+            arrival_ns = time.time_ns()
             f = (parse_imu_datagram(data) if args.imu
                  else parse_datagram(data, addr[0]))
             if f is None:
@@ -695,12 +747,12 @@ def main(argv=None):
                 mislabelled_warned = True
                 want = "calibrated" if args.calibrated else "raw"
                 got = "calibrated" if f["calibrated"] else "raw"
-                print(f"! WARNING: {group}:{port} is the {want} group but "
-                      f"this frame is flagged {got} "
-                      f"({f['sensor_serial'] or addr[0]}). The CSV records "
-                      f"each frame's own flag; treat the units with "
-                      f"suspicion and check the unit's firmware.",
-                      file=sys.stderr, flush=True)
+                say(f"! WARNING: {group}:{port} is the {want} group but "
+                    f"this frame is flagged {got} "
+                    f"({f['sensor_serial'] or addr[0]}). The CSV records "
+                    f"each frame's own flag; treat the units with "
+                    f"suspicion and check the unit's firmware.",
+                    file=sys.stderr, flush=True)
 
             # Thin attitude to the requested rate before anything writes
             # it. Standalone stream only -- the per-frame trailer already
@@ -723,15 +775,16 @@ def main(argv=None):
                     note = ("  [legacy v1: no identity in the frame, keyed on "
                             "source IP. Update to fw 1.7.0+ for reliable "
                             "multi-sensor separation.]")
-                print(f"+ sensor {st.label() or key} from {addr[0]}{note}",
-                      flush=True)
+                say(f"+ sensor {st.label() or key} from {addr[0]}{note}",
+                    flush=True)
             st.update(f)
 
+            csv_row = None
             if csv_out is not None and args.imu:
-                csv_out.writerow([_csv_cell(f.get(c)) for c in _IMU_CSV_COLUMNS])
+                csv_row = [_csv_cell(f.get(c)) for c in _IMU_CSV_COLUMNS]
             elif csv_out is not None and f["spectrum"] is not None:
                 _imu = f.get("imu") or {}
-                csv_out.writerow(
+                csv_row = (
                     [key, f["sensor_serial"] or "", f["model"] or "",
                      f["seq"], f["timestamp_us"], int(f["ptp_synced"]),
                      f["integration_time_ms"] or "", int(f["saturated"]),
@@ -757,38 +810,46 @@ def main(argv=None):
             to_daq = False
             if (args.daq and not daq_gave_up
                     and (args.imu or f["spectrum"] is not None)):
-                if daq_writer is None:
-                    daq_writer, daq_path = _open_daq(args, f, addr[0])
+                if daq_path is None:
+                    make, daq_path = _open_daq(args, f, addr[0], say)
                     daq_key = key
-                    daq_gave_up = daq_writer is None
-                if daq_writer is not None:
+                    daq_gave_up = make is None
+                    # Queued ahead of every row it will hold.
+                    if make is not None and not files.submit(_open, make):
+                        say(f"! --daq: the disk is too far behind to even "
+                            f"create {daq_path}; nothing recorded to it",
+                            file=sys.stderr, flush=True)
+                        daq_path, daq_gave_up = None, True
+                if daq_path is not None:
                     if key == daq_key:
                         to_daq = True
                     elif key not in daq_others:
                         daq_others.add(key)
-                        print(f"! --daq records one unit per file: "
-                              f"{daq_path} holds {daq_key}; frames from "
-                              f"{key} ({addr[0]}) are not in it. Use "
-                              f"--serial to pick the unit, or run one "
-                              f"daq_stream.py per unit.",
-                              file=sys.stderr, flush=True)
+                        say(f"! --daq records one unit per file: "
+                            f"{daq_path} holds {daq_key}; frames from "
+                            f"{key} ({addr[0]}) are not in it. Use "
+                            f"--serial to pick the unit, or run one "
+                            f"daq_stream.py per unit.",
+                            file=sys.stderr, flush=True)
 
+            # Built here, so the frame keeps its arrival stamp however long
+            # the disk then takes over it.
+            daq_call = None
             # --- .daq: attitude ------------------------------------------
             if to_daq and args.imu:
-                daq_writer.write_attitude(
-                    f,
+                daq_call = ("write_attitude", (f,), dict(
                     timestamp_ns=(f["timestamp_us"] * 1000
                                   if f["absolute_time"]
-                                  else time.time_ns()),
+                                  else arrival_ns),
                     device_timestamp_ns=(f["timestamp_us"] * 1000
                                          if f["absolute_time"] else None),
-                    device_ts_ptp=f["ptp_synced"])
+                    device_ts_ptp=f["ptp_synced"]))
 
             # --- .daq: spectra -------------------------------------------
             if to_daq and not args.imu:
-                daq_writer.write(
+                daq_call = ("write", (
                     f["spectrum"], f["saturated"],
-                    f["integration_time_ms"] or 0,
+                    f["integration_time_ms"] or 0), dict(
                     # The sensor latches timestamp_us as its own last
                     # byte arrives, so it beats host arrival time -- but
                     # only when it is an absolute epoch. A free-running
@@ -798,17 +859,31 @@ def main(argv=None):
                     # rest.
                     timestamp_ns=(f["timestamp_us"] * 1000
                                   if f["absolute_time"]
-                                  else time.time_ns()),
+                                  else arrival_ns),
                     device_timestamp_ns=(f["timestamp_us"] * 1000
                                          if f["absolute_time"] else None),
                     device_ts_ptp=f["ptp_synced"],
-                    imu=f.get("imu"))
+                    imu=f.get("imu")))
+
+            if csv_row is not None or daq_call is not None:
+                if files.submit(_store, csv_row, daq_call):
+                    if stalled:
+                        say(f"  disk caught up: {stalled} frame(s) were "
+                            f"lost while it was stalled", file=sys.stderr,
+                            flush=True)
+                        stalled = 0
+                else:
+                    if not stalled:
+                        say(f"! the disk is {files.backlog} frames "
+                            f"behind; new frames are being DROPPED until "
+                            f"it catches up", file=sys.stderr, flush=True)
+                    stalled += 1
 
             if not args.quiet and st.frames % 20 == 1:
                 peak = max(f["spectrum"]) if f["spectrum"] else float("nan")
-                print(f"  {st.label():34} seq={f['seq']:<8} "
-                      f"t={f['integration_time_ms'] or '?':>4}ms  peak={peak:.4g}",
-                      flush=True)
+                say(f"  {st.label():34} seq={f['seq']:<8} "
+                    f"t={f['integration_time_ms'] or '?':>4}ms  peak={peak:.4g}",
+                    flush=True)
 
             n += 1
             if args.count and n >= args.count:
@@ -817,13 +892,18 @@ def main(argv=None):
         pass
     finally:
         sock.close()
-        if csv_fh is not None:
-            csv_fh.close()
-        if daq_writer is not None:
-            daq_writer.close()
+        if say is not print:
+            say.close()
+        if files is not None:
+            if files.backlog:
+                print(f"  writing {files.backlog} queued frame(s) to disk ...",
+                      flush=True)
+            files.close()
 
     print(f"\n{len(devices)} sensor(s), {n} frame(s)"
           + (f", {bad} malformed datagram(s)" if bad else "")
+          + (f", {files.dropped} DROPPED waiting for the disk"
+             if files is not None and files.dropped else "")
           + (f", {imu_dropped} sample(s) thinned to {args.imu_rate:g} Hz"
              if imu_dropped else ""))
     for st in devices.values():

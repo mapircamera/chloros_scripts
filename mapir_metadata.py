@@ -21,6 +21,9 @@ Two outputs:
     as LATTICE, group correctly, and calibrate by serial.
   * DaqWriter(...)              -> a .daq SQLite file Chloros matches to the
     imagery by timestamp and calibrates by serial.
+    WriteBehind(...) runs its writes on their own thread, and PrintBehind its
+    console output, so a disk busy with camera frames never stops the sensor
+    loop.
 
 Timezone contract (so reflectance matching works on ANY processing host):
 naive wall-clock stamps are ambiguous, so both outputs DECLARE their zone --
@@ -36,8 +39,10 @@ verbatim copies of the actual Chloros reader functions.
 
 import io
 import os
+import queue
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -453,13 +458,21 @@ class DaqWriter:
     cap_applied : bool    True when a cap / geometry per-wavelength profile
                           was folded into the written spectra. Only meaningful
                           alongside ``calibration_applied``.
+    commit_every : int    Commit after every N rows written (default 10).
+                          A commit is a disk flush, and on a disk something
+                          else is writing to it can take many seconds, so a
+                          recorder that writes from its acquisition loop
+                          should pass 0 (never commit by itself) and hand the
+                          writer to a :class:`WriteBehind`, which commits on
+                          its own thread.
     """
 
     def __init__(self, path, *, product_model, product_serial,
                  device_name="", cap_id=None, cap_id_source=None,
                  tz_offset_minutes=0,
                  calibration_applied=False, calibration_bundle_sha="",
-                 calibration_completed_utc="", cap_applied=False):
+                 calibration_completed_utc="", cap_applied=False,
+                 commit_every=10):
         kind = str(product_model).strip().lower()
         if kind not in _VALID_KINDS:
             raise ValueError(
@@ -503,7 +516,21 @@ class DaqWriter:
         # filename is timestamped, so this only matters if you reuse --output.
         if os.path.exists(path):
             os.remove(path)
-        self._conn = sqlite3.connect(path)
+        # check_same_thread=False so a WriteBehind thread can take the writer
+        # over once it is built. One thread at a time still: DaqWriter has no
+        # lock of its own.
+        #
+        # Journal and sync stay at SQLite's defaults (rollback journal,
+        # synchronous=FULL) on purpose. WAL + synchronous=NORMAL would flush
+        # less often, but a WAL file that is not closed cleanly keeps its
+        # recent rows in a -wal sidecar that must travel with the .daq: a
+        # killed WAL recording copied without it read back 0 of 50 committed
+        # rows read-only, as Chloros opens it, where a rollback-journal one
+        # read all 50 (2026-10-19). With the commits off the
+        # acquisition thread, the flushes cost the file some latency and the
+        # readings nothing.
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._commit_every = max(0, int(commit_every))
         cur = self._conn.cursor()
         cur.execute(_ALS_META_DDL)
         cur.execute(_ALS_LOG_DDL)
@@ -609,7 +636,7 @@ class DaqWriter:
              int(bool(is_saturated)), int(integration_time_ms),
              dev_ts, dev_ptp) + imu_row)
         self._count += 1
-        if self._count % 10 == 0:
+        if self._commit_every and self._count % self._commit_every == 0:
             self._conn.commit()
 
     def write_attitude(self, imu, timestamp_ns=None, *,
@@ -659,7 +686,8 @@ class DaqWriter:
              _as_float(imu.get("tilt_deg")), _as_float(imu.get("roll_deg")),
              _as_float(imu.get("pitch_deg")), _as_int(imu.get("temp_raw"))))
         self._attitude_count += 1
-        if (self._count + self._attitude_count) % 10 == 0:
+        if (self._commit_every and
+                (self._count + self._attitude_count) % self._commit_every == 0):
             self._conn.commit()
 
     @property
@@ -681,6 +709,11 @@ class DaqWriter:
     def record_count(self):
         return self._count
 
+    def commit(self):
+        """Make every row written so far durable (one disk flush)."""
+        if self._conn is not None:
+            self._conn.commit()
+
     def close(self):
         if self._conn is not None:
             self._conn.commit()
@@ -692,3 +725,197 @@ class DaqWriter:
 
     def __exit__(self, *exc):
         self.close()
+
+
+# ===========================================================================
+# Writing off the acquisition thread
+# ===========================================================================
+
+class WriteBehind:
+    """Run a recorder's file writes on a thread of their own, so a slow disk
+    delays the FILE, never the sensor.
+
+    A DaqWriter commit is a disk flush, and on ext4 (data=ordered) a flush
+    also waits for every other process's dirty data on that filesystem. With
+    LATTICE cameras writing TIFFs to the same NVMe, single commits took
+    12-37 s on the Jetson rig (2026-10-19), and record_daq -- which wrote
+    from its acquisition loop -- took no readings at all for that long, and
+    said nothing. Behind this class the acquisition loop only queues, and
+    each reading keeps the timestamp it was taken with. Its console output
+    belongs behind a :class:`PrintBehind` for the same reason.
+
+    Usage::
+
+        w = DaqWriter(path, ..., commit_every=0)     # the thread commits
+        wb = WriteBehind(commit=w.commit, close=w.close)
+        while recording:
+            spec, it, sat = sensor.read()
+            ts = time.time_ns()                      # taken now, not later
+            if not wb.submit(w.write, spec, sat, it, timestamp_ns=ts):
+                ...                                  # queue full: say so
+        wb.close()            # writes everything queued, commits, closes w
+
+    submit() queues one call and returns at once. The thread makes the calls
+    in order and calls ``commit`` once at least ``commit_interval_s`` has
+    passed since the last one, so readings that queued up behind a slow
+    commit go into the next one together -- up to ``max_batch`` of them, which
+    keeps a transaction inside SQLite's page cache, so the file on disk is
+    only touched at commit. Power loss costs at most what was queued plus one
+    commit interval; the rollback journal keeps the file itself consistent.
+
+    The queue is bounded (``max_items``). A full queue means the disk has
+    been stalled for longer than it holds; submit() then drops the call,
+    counts it in ``dropped`` and returns False, and the caller says so. A
+    call that raises stops the thread: the error is kept in ``error`` and
+    re-raised by the next submit() and by close(), after whatever could
+    still be committed was.
+    """
+
+    _STOP = object()
+
+    def __init__(self, *, commit, close=None, max_items=5000,
+                 commit_interval_s=2.0, max_batch=500, name="write-behind"):
+        self._commit = commit
+        self._close = close
+        self._interval = float(commit_interval_s)
+        self._max_batch = max(1, int(max_batch))
+        self._q = queue.Queue(maxsize=max(1, int(max_items)))
+        self.max_items = self._q.maxsize
+        self.dropped = 0
+        self.written = 0
+        self.max_backlog = 0
+        self.slowest_commit_s = 0.0
+        self.error = None
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name=name,
+                                        daemon=True)
+        self._thread.start()
+
+    @property
+    def backlog(self):
+        """Calls queued and not yet made."""
+        return self._q.qsize()
+
+    def submit(self, fn, *args, **kwargs):
+        """Queue fn(*args, **kwargs). False when the queue is full and the
+        call was dropped."""
+        if self.error is not None:
+            raise self.error
+        if self._closed:
+            raise RuntimeError("WriteBehind is closed")
+        try:
+            self._q.put_nowait((fn, args, kwargs))
+        except queue.Full:
+            self.dropped += 1
+            return False
+        depth = self._q.qsize()
+        if depth > self.max_backlog:
+            self.max_backlog = depth
+        return True
+
+    def _timed_commit(self):
+        t = time.monotonic()
+        self._commit()
+        self.slowest_commit_s = max(self.slowest_commit_s,
+                                    time.monotonic() - t)
+
+    def _run(self):
+        pending = 0
+        last = time.monotonic()
+        try:
+            while True:
+                timeout = (None if not pending
+                           else max(0.0, last + self._interval
+                                    - time.monotonic()))
+                try:
+                    item = self._q.get(timeout=timeout)
+                except queue.Empty:
+                    item = None                  # commit deadline reached
+                if item is self._STOP:
+                    break
+                if item is not None:
+                    fn, args, kwargs = item
+                    fn(*args, **kwargs)
+                    self.written += 1
+                    pending += 1
+                if pending and (pending >= self._max_batch or
+                                time.monotonic() - last >= self._interval):
+                    self._timed_commit()
+                    pending = 0
+                    last = time.monotonic()
+            self._timed_commit()
+        except BaseException as e:               # noqa: BLE001 -- reported
+            self.error = e
+            try:
+                self._commit()                   # keep what was written
+            except BaseException:                # noqa: BLE001
+                pass
+        finally:
+            if self._close is not None:
+                try:
+                    self._close()
+                except BaseException as e:       # noqa: BLE001
+                    if self.error is None:
+                        self.error = e
+
+    def close(self):
+        """Make every queued call, commit, run ``close``, and stop the
+        thread. Blocks for as long as the disk takes."""
+        if not self._closed:
+            self._closed = True
+            # put() blocks while the queue is full, which is fine while the
+            # thread is draining it -- but not once the thread has died.
+            while self._thread.is_alive():
+                try:
+                    self._q.put(self._STOP, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
+            self._thread.join()
+        if self.error is not None:
+            raise self.error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class PrintBehind:
+    """print(), on a thread of its own, for messages from a sensor loop.
+
+    stdout redirected to a file on a busy disk blocks like any other write:
+    on the Jetson rig (2026-10-19), with record_daq's log on the NVMe the
+    cameras were writing to, single progress lines took up to 3.3 s to
+    print, and the readings stopped for that long even with the .daq behind
+    a WriteBehind. On ext4 any write there waits for the journal, which
+    waits for the cameras' data. Call this like print(); the line appears
+    when the disk lets it, and close() waits for the ones still queued.
+    """
+
+    _STOP = object()
+
+    def __init__(self):
+        self._q = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="print-behind",
+                                        daemon=True)
+        self._thread.start()
+
+    def __call__(self, *args, **kwargs):
+        self._q.put((args, kwargs))
+
+    def _run(self):
+        while True:
+            item = self._q.get()
+            if item is self._STOP:
+                return
+            try:
+                print(*item[0], **item[1])
+            except (OSError, ValueError):  # closed/broken stdout: not fatal
+                pass
+
+    def close(self):
+        if self._thread.is_alive():
+            self._q.put(self._STOP)
+            self._thread.join()

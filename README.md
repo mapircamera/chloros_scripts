@@ -192,6 +192,16 @@ Common options:
 Press **Ctrl-C** to stop. The script records continuously; mount the sensor
 upward-facing (downwelling) and run it for the whole flight.
 
+**Recording beside cameras on one disk is fine.** The `.daq`, the `--csv` and
+the console output are written on threads of their own, so a busy disk delays
+the file, never the readings. On a Jetson with three cameras writing TIFFs to
+the same NVMe, single commits took 14-17 s and the readings carried on at the
+sensor's ~5.4/s. They wait in memory meanwhile (up to 5000, ~15 minutes' worth).
+If the disk falls further behind than that, new readings are dropped, and the
+run says so while it happens and counts them at the end. After Ctrl-C it writes
+every reading it took before exiting, which can take as long as the disk needs:
+wait for `Stopped.`. `daq_stream.py --daq` / `--csv` write the same way.
+
 ## Light sensor only — getting a calibrated `.csv` out of Chloros
 
 Plenty of setups are **just a light sensor**: no camera, no imagery, no

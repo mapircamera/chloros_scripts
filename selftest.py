@@ -344,7 +344,7 @@ def _cal_135():
         bundle_sha="5e1f" * 16, sensor_id="daq-e-a1b2c3")
 
 
-def _record(kind, argv, dev, *, cal=None, read_spectrum=None):
+def _record(kind, argv, dev, *, cal=None, read_spectrum=None, out=None):
     """Run record_daq.main() against fakes; return (stdout, stderr, error)."""
     import daq_cal
     saved = (R.SerialTransport, R.TcpTransport, R.DaqEControl,
@@ -357,7 +357,7 @@ def _record(kind, argv, dev, *, cal=None, read_spectrum=None):
             lambda cls, *a, **k: cal)
     if read_spectrum is not None:
         R.DaqSensor.read_spectrum = read_spectrum
-    out, err = io.StringIO(), io.StringIO()
+    out, err = out or io.StringIO(), io.StringIO()
     error = None
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -446,6 +446,354 @@ def test_record_daq_runs():
     check("--duration ends a run whose sensor never answers",
           e is None and time.monotonic() - t_start < 3.0,
           f"{type(e).__name__} after {time.monotonic() - t_start:.1f}s")
+
+
+class _SlowDisk:
+    """sqlite3.connect() whose connections are as slow as a disk under load.
+
+    A commit is a disk flush, and on the Jetson rig (2026-10-19), with four
+    cameras writing TIFFs to the same ext4 NVMe, single commits took 12-20 s.
+    ``commit_s`` sleeps in every commit after the first (the header commit,
+    made before any reading); ``insert_s`` in every row insert, for a disk
+    slower than the sensor. Patched at the sqlite3 level so it slows the
+    recorder whichever way the recorder drives the connection.
+    """
+
+    def __init__(self, *, commit_s=0.0, insert_s=0.0):
+        self.commit_s, self.insert_s = commit_s, insert_s
+        self.commits = 0
+        self._real = sqlite3.connect
+
+    def __enter__(self):
+        disk = self
+
+        class _Conn:
+            def __init__(self, conn):
+                self._c = conn
+
+            def commit(self):
+                if disk.commits:
+                    time.sleep(disk.commit_s)
+                disk.commits += 1
+                self._c.commit()
+
+            def execute(self, sql, *a):
+                if disk.insert_s and sql.startswith("INSERT INTO als_log"):
+                    time.sleep(disk.insert_s)
+                return self._c.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+        sqlite3.connect = lambda *a, **k: _Conn(disk._real(*a, **k))
+        return self
+
+    def __exit__(self, *exc):
+        sqlite3.connect = self._real
+
+
+class _StallingStream(io.StringIO):
+    """A stdout that blocks once, the way a log file on a busy disk does:
+    with record_daq's log on the NVMe the cameras were writing to, single
+    progress lines took up to 3.3 s to print (Jetson rig, 2026-10-19)."""
+
+    def __init__(self, marker, stall_s):
+        super().__init__()
+        self.marker, self.stall_s, self.stalled = marker, stall_s, False
+
+    def write(self, text):
+        if not self.stalled and self.marker in text:
+            self.stalled = True
+            time.sleep(self.stall_s)
+        return super().write(text)
+
+
+def _paced_sensor(period_s, taken, *, sigint_after=None, fail_after=None):
+    """A read_spectrum that answers every ``period_s``, as a sensor does, and
+    notes (in ``taken``) the wall clock each reading came back at."""
+    import signal as _signal
+    spec = [float(i) for i in range(135)]
+
+    def read_spectrum(self):
+        time.sleep(period_s)
+        if fail_after is not None and len(taken) >= fail_after:
+            raise ConnectionError("DAQ-E closed the connection")
+        taken.append(time.time_ns())
+        if sigint_after is not None and len(taken) == sigint_after:
+            os.kill(os.getpid(), _signal.SIGINT)        # an operator's Ctrl-C
+        return list(spec), 32, False
+    return read_spectrum
+
+
+def _stamps(path):
+    _, specs = chloros_read_daq(path) if os.path.exists(path) else ({}, [])
+    return [ts for ts, _, _, _ in specs]
+
+
+def _stamped_on_arrival(stamps, taken, tol_ns=50_000_000):
+    """Every reading taken is in the file, in order, stamped when it came off
+    the sensor rather than when the disk took it."""
+    return (len(stamps) == len(taken)
+            and all(0 <= s - t <= tol_ns for s, t in zip(stamps, taken)))
+
+
+def test_disk_stall():
+    """A recording must not stop taking readings while the disk is busy.
+
+    Jetson rig, 2026-10-19: record_daq on the DAQ-E alongside four LATTICE
+    cameras writing ~11 TIFFs/s to the same NVMe. Readings flowed at ~5/s,
+    then stopped for 12-20 s with nothing printed, twice in three runs:
+    record_daq committed from its acquisition loop, every commit flushes the
+    disk, and on ext4 that flush waited for the cameras' data. The readings
+    of those seconds were never taken.
+    """
+    print("\n-- a busy disk never stops the readings (record_daq, daq_stream) --")
+    period, stall = 0.02, 1.0
+
+    # 1. Commits that take a second each. The sensor answers every 20 ms; the
+    #    file must too, with no hole anywhere near the length of a commit.
+    p = os.path.join(OUT, "stall_rate.daq")
+    taken = []
+    with _SlowDisk(commit_s=stall):
+        so, _, e = _record("u", ["--port", "FAKE", "--duration", "2.5",
+                                 "--output", p], _RecDev([1, 2, 3, 4, 5], []),
+                           read_spectrum=_paced_sensor(period, taken))
+    stamps = _stamps(p)
+    gap = max((b - a for a, b in zip(stamps, stamps[1:])), default=0) / 1e9
+    check("stalled commits: the run completes", e is None, repr(e))
+    check("stalled commits: no gap in the readings near the stall length",
+          stamps and gap < stall / 4,
+          f"longest gap {gap:.2f} s with {stall:.1f} s commits")
+    want = 2.5 / period
+    check("stalled commits: readings keep the sensor's rate",
+          len(stamps) >= 0.6 * want,
+          f"{len(stamps)} readings in 2.5 s; the sensor gave {want:.0f}")
+    check("stalled commits: every reading is in the file, stamped on arrival",
+          _stamped_on_arrival(stamps, taken),
+          f"{len(stamps)} in the file, {len(taken)} taken")
+    span = (stamps[-1] - stamps[0]) / 1e9 if stamps else 0.0
+    check("stalled commits: readings run to the end of --duration",
+          span > 2.5 - 0.3, f"first to last reading {span:.2f} s")
+    check("stalled commits: the summary says the disk was slow, nothing lost",
+          "no reading was lost" in so,
+          next((ln.strip() for ln in so.splitlines() if "was slow" in ln),
+               "(no such line)"))
+
+    # 2. --frames ends the run while readings are still queued behind a disk
+    #    slower than the sensor. Every one of them has to land.
+    p = os.path.join(OUT, "stall_drain.daq")
+    taken = []
+    with _SlowDisk(commit_s=0.5, insert_s=0.02):
+        so, _, e = _record("u", ["--port", "FAKE", "--frames", "60",
+                                 "--output", p, "--csv"],
+                           _RecDev([1, 2, 3, 4, 5], []),
+                           read_spectrum=_paced_sensor(0.002, taken))
+    stamps = _stamps(p)
+    check("--frames with a slow disk: readings were still queued at the end",
+          "queued reading(s) to disk" in so,
+          next((ln for ln in so.splitlines() if "queued" in ln), "no backlog"))
+    check("--frames with a slow disk: all of them land in the .daq",
+          e is None and len(stamps) == 60 and _stamped_on_arrival(stamps, taken),
+          f"{len(stamps)} of 60 ({e!r})")
+    cv = os.path.splitext(p)[0] + ".csv"
+    rows = ([r for r in csv.reader(open(cv, newline="", encoding="utf-8"))
+             if r and not r[0].startswith("#") and r[0] != "timestamp_utc"]
+            if os.path.exists(cv) else [])
+    check("--frames with a slow disk: ...and in the CSV, same stamps",
+          [int(r[1]) for r in rows] == stamps, f"{len(rows)} CSV rows")
+    # The journal and sync settings are SQLite's defaults, as before; what
+    # changed is which thread commits and how often. Read the result back
+    # through the real Chloros loader too.
+    repo = _chloros_repo()
+    if repo is None:
+        skip("write-behind .daq through mip.daq_dls",
+             "set CHLOROS_REPO to a mapirlab checkout")
+    else:
+        saved = list(sys.path)
+        try:
+            sys.path.insert(0, repo)
+            from mip.daq_dls import load_calibrated      # noqa: E402
+            scan = load_calibrated(p)
+            _, specs = chloros_read_daq(p)
+            same = (scan is not None and len(scan.times) == len(specs) == 60
+                    and np.allclose(scan.times, [s[0] / 1e9 for s in specs],
+                                    rtol=0, atol=1e-6)
+                    and np.array_equal(
+                        np.asarray(scan.spectra, dtype=np.float32),
+                        np.stack([s[1] for s in specs])))
+            check("real Chloros reader: the write-behind .daq reads back "
+                  "identically", same,
+                  "" if same else f"{None if scan is None else len(scan.times)}"
+                                  f" frames via mip.daq_dls")
+        except ImportError as e:
+            skip("write-behind .daq through mip.daq_dls", f"import failed: {e}")
+        finally:
+            sys.path[:] = saved
+
+    # 3. Ctrl-C mid-backlog: a clean stop writes everything already taken.
+    p = os.path.join(OUT, "stall_sigint.daq")
+    taken = []
+    with _SlowDisk(commit_s=0.5, insert_s=0.02):
+        so, _, e = _record("u", ["--port", "FAKE", "--output", p],
+                           _RecDev([1, 2, 3, 4, 5], []),
+                           read_spectrum=_paced_sensor(0.002, taken,
+                                                       sigint_after=40))
+    stamps = _stamps(p)
+    check("Ctrl-C with readings queued: every reading taken lands",
+          e is None and len(taken) >= 40
+          and _stamped_on_arrival(stamps, taken),
+          f"{len(stamps)} in the file, {len(taken)} taken ({e!r})")
+
+    # 4. The sensor link dies mid-backlog: the error still surfaces, and the
+    #    readings taken before it are not lost with it.
+    p = os.path.join(OUT, "stall_error.daq")
+    taken = []
+    with _SlowDisk(commit_s=0.5, insert_s=0.02):
+        so, _, e = _record("u", ["--port", "FAKE", "--output", p],
+                           _RecDev([1, 2, 3, 4, 5], []),
+                           read_spectrum=_paced_sensor(0.002, taken,
+                                                       fail_after=30))
+    stamps = _stamps(p)
+    check("sensor error with readings queued: the error is raised",
+          isinstance(e, ConnectionError), repr(e))
+    check("sensor error with readings queued: the 30 taken still land",
+          _stamped_on_arrival(stamps, taken), f"{len(stamps)} of {len(taken)}")
+
+    # 5. A disk stalled for longer than the queue holds: readings ARE lost
+    #    then, and the run must say so -- live and in its summary -- and
+    #    account for every one.
+    p = os.path.join(OUT, "stall_overflow.daq")
+    taken = []
+    saved = getattr(R, "WRITE_QUEUE_READINGS", None)
+    R.WRITE_QUEUE_READINGS = 5
+    try:
+        with _SlowDisk(insert_s=0.05):
+            so, se, e = _record("u", ["--port", "FAKE", "--frames", "60",
+                                      "--output", p],
+                                _RecDev([1, 2, 3, 4, 5], []),
+                                read_spectrum=_paced_sensor(0.002, taken))
+    finally:
+        R.WRITE_QUEUE_READINGS = saved
+    stamps = _stamps(p)
+    lost = 60 - len(stamps)
+    check("queue overflow: says so while it happens",
+          "being DROPPED" in se, se.strip().splitlines()[0] if se else "")
+    check("queue overflow: the summary counts exactly what was lost",
+          e is None and lost > 0
+          and f"{lost} of 60 readings were DROPPED" in se,
+          f"{lost} lost; stderr: {se.strip().splitlines()[-1:] or ''}")
+    _it = iter(taken)                           # kept = a subsequence
+    check("queue overflow: what was kept is in order, stamped on arrival",
+          all(any(0 <= s - t <= 50_000_000 for t in _it) for s in stamps),
+          f"{len(stamps)} kept")
+
+    # 6. The disk fails outright: the recorder stops with that error rather
+    #    than taking readings it can no longer write, and does not hang.
+    p = os.path.join(OUT, "stall_diskfull.daq")
+    real_write = mm.DaqWriter.write
+
+    def full(self, *a, **k):
+        if self.record_count >= 3:
+            raise sqlite3.OperationalError("database or disk is full")
+        return real_write(self, *a, **k)
+    mm.DaqWriter.write = full
+    taken = []
+    try:
+        _, _, e = _record("u", ["--port", "FAKE", "--duration", "5",
+                                "--output", p], _RecDev([1, 2, 3, 4, 5], []),
+                          read_spectrum=_paced_sensor(period, taken))
+    finally:
+        mm.DaqWriter.write = real_write
+    # Counted in readings, not seconds: how long the file takes to close
+    # is the disk's business. A loop that carried on would take ~250.
+    check("disk error: the run stops with it, promptly",
+          isinstance(e, sqlite3.OperationalError) and len(taken) < 30,
+          f"{e!r} after {len(taken)} readings")
+    check("disk error: the rows written before it are kept",
+          len(_stamps(p)) == 3, f"{len(_stamps(p))} rows")
+
+    # 7. stdout in a log file on that same disk: a print there blocks like
+    #    any other write, so the loop's own progress lines must not wait.
+    p = os.path.join(OUT, "stall_stdout.daq")
+    taken = []
+    slow_out = _StallingStream("readings ...", stall)
+    _, _, e = _record("u", ["--port", "FAKE", "--duration", "2.0",
+                            "--output", p], _RecDev([1, 2, 3, 4, 5], []),
+                      read_spectrum=_paced_sensor(period, taken), out=slow_out)
+    stamps = _stamps(p)
+    gap = max((b - a for a, b in zip(stamps, stamps[1:])), default=0) / 1e9
+    check("stdout blocked mid-run: the readings do not wait for it",
+          e is None and slow_out.stalled and gap < stall / 4
+          and len(stamps) >= 0.6 * 2.0 / period,
+          f"{len(stamps)} readings, longest gap {gap:.2f} s with a "
+          f"{stall:.1f} s print ({e!r})")
+    check("stdout blocked mid-run: its lines still all come out",
+          "Stopped. Wrote" in slow_out.getvalue()
+          and slow_out.getvalue().count("readings ...") == len(taken) // 10,
+          f"{slow_out.getvalue().count('readings ...')} progress lines for "
+          f"{len(taken)} readings")
+
+    # 8. daq_stream --daq: the same stalls must not hold up the socket. A
+    #    frame without a device clock is stamped on arrival, so a receive
+    #    loop stuck in a commit or a print shows up as a hole in its stamps.
+    import daq_stream as ds
+
+    def _stream(p, argv, stdout):
+        arrived = []
+
+        class _S:
+            def setsockopt(self, *a): pass
+            def settimeout(self, *a): pass
+            def bind(self, *a): pass
+            def close(self): pass
+
+            def recvfrom(self, _n):
+                time.sleep(period)
+                b = bytearray(_v2_frame(b"\x11\x22\x33\x44\x55",
+                                        b"\xaa\xbb\xcc\xdd\xee\x01",
+                                        seq=len(arrived) + 1))
+                b[3] &= ~ds.FLAG_ABS_TS & 0xFF       # no device clock
+                b[-2:] = struct.pack("<H", ds._crc16_ccitt(bytes(b[:-2])))
+                arrived.append(time.time_ns())
+                return bytes(b), ("10.0.0.9", 5002)
+        real, real_q = ds.socket.socket, ds._query_unit
+        ds.socket.socket = lambda *a, **k: _S()
+        ds._query_unit = lambda host, **k: {"name": "daq-e-a1b2c3",
+                                            "status": None}
+        e = None
+        try:
+            with contextlib.redirect_stdout(stdout):
+                ds.main(["--daq", p, "--duration", "2.5"] + argv)
+        except BaseException as ex:              # noqa: BLE001
+            e = ex
+        finally:
+            ds.socket.socket, ds._query_unit = real, real_q
+        stamps = _stamps(p)
+        gap = max((b - a for a, b in zip(stamps, stamps[1:])),
+                  default=0) / 1e9
+        return e, stamps, arrived, gap
+
+    p = os.path.join(OUT, "stall_stream.daq")
+    with _SlowDisk(commit_s=stall):
+        e, stamps, arrived, gap = _stream(p, ["--quiet"], io.StringIO())
+    # Counted too: a loop stuck for the whole run has no gaps either.
+    check("daq_stream --daq, stalled commits: no gap near the stall length",
+          e is None and gap < stall / 4 and len(stamps) >= 0.6 * 2.5 / period,
+          f"{len(stamps)} frames, longest gap {gap:.2f} s with {stall:.1f} s "
+          f"commits ({e!r})")
+    # The first frame is the one that opens the .daq (a disk flush of its
+    # own); it is stamped on arrival like the rest.
+    check("daq_stream --daq, stalled commits: every frame, stamped on arrival",
+          _stamped_on_arrival(stamps, arrived),
+          f"{len(stamps)} in the file, {len(arrived)} arrived")
+    p = os.path.join(OUT, "stall_stream_stdout.daq")
+    slow_out = _StallingStream("seq=", stall)
+    e, stamps, arrived, gap = _stream(p, [], slow_out)
+    check("daq_stream --daq, stdout blocked: no gap near the stall length",
+          e is None and slow_out.stalled and gap < stall / 4
+          and len(stamps) >= 0.6 * 2.5 / period,
+          f"{len(stamps)} frames, longest gap {gap:.2f} s with a "
+          f"{stall:.1f} s print ({e!r})")
 
 
 # ===========================================================================
@@ -2088,6 +2436,7 @@ def main():
     test_metadata_contract()
     test_wire_codec()
     test_record_daq_runs()
+    test_disk_stall()
     test_camera_config()
     test_cable_sync_ordering()
     test_camera_capture_flow()

@@ -58,7 +58,12 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from mapir_metadata import DaqWriter, _VALID_KINDS
+from mapir_metadata import DaqWriter, PrintBehind, WriteBehind, _VALID_KINDS
+
+# Readings that may wait for the disk before new ones are dropped: ~15 min at
+# the ~5.4 readings/s a DAQ-E gives, ~25 MB of memory. The files are written
+# on their own thread (see main), so this only fills while the disk is stalled.
+WRITE_QUEUE_READINGS = 5000
 
 # "apply no per-wavelength profile at all" -- mirrors daq_cal.CAP_ID_AS_RECORDED
 # and Chloros's daq.calibration_apply._CAP_ID_AS_RECORDED.
@@ -667,7 +672,8 @@ def main(argv=None):
         calibration_applied=baking,
         calibration_bundle_sha=(cal.bundle_sha if baking else ""),
         calibration_completed_utc=(cal.completed_utc if baking else ""),
-        cap_applied=cap_was_applied)
+        cap_applied=cap_was_applied,
+        commit_every=0)         # the write-behind thread commits (see below)
 
     csv_path = None
     csv_fh = None
@@ -764,8 +770,58 @@ def main(argv=None):
               "at import)")
     print("  Ctrl-C to stop.", flush=True)
 
+    # The files are written on a thread of their own; this loop only takes
+    # readings and queues them. A commit is a disk flush, and on ext4 a flush
+    # also waits for every other writer's dirty data: with cameras writing
+    # TIFFs to the same NVMe, single commits took 12-37 s on the Jetson rig,
+    # and while this loop waited in one no readings were taken at all.
+    def _store(spec, inttime, sat, ts, calibrated):
+        """One reading into the .daq (and CSV). Runs on the writer thread."""
+        nonlocal _csv_header_written
+        writer.write(calibrated if baking else spec,
+                     is_saturated=sat, integration_time_ms=inttime,
+                     timestamp_ns=ts)
+        if csv_out is not None:
+            _vals = calibrated if csv_calibrated else spec
+            if not _csv_header_written:
+                # Raw: the point count is only known once a
+                # frame has arrived, so the column row waits for
+                # one rather than guessing 135.
+                _csv_header_written = True
+                csv_out.writerow(
+                    ["timestamp_utc", "timestamp_ns",
+                     "integration_time_ms", "saturated",
+                     "calibrated", "units"]
+                    + [f"idx_{i}" for i in range(len(_vals))])
+            csv_out.writerow(
+                [datetime.fromtimestamp(ts / 1e9,
+                                        timezone.utc).isoformat(
+                    timespec="milliseconds"),
+                 ts, inttime, int(bool(sat)), int(csv_calibrated),
+                 "W/m^2/nm" if csv_calibrated else "counts"]
+                + [f"{v:.6g}" for v in _vals])
+
+    def _commit():
+        writer.commit()
+        if csv_fh is not None:
+            csv_fh.flush()
+
+    def _close_files():
+        try:
+            writer.close()
+        finally:
+            if csv_fh is not None:
+                csv_fh.close()
+
+    files = WriteBehind(commit=_commit, close=_close_files,
+                        max_items=WRITE_QUEUE_READINGS, name="daq-writer")
+    # The loop prints through this rather than print(): with stdout in a log
+    # file on the same busy disk, one progress line took 3.3 s on the rig.
+    say = PrintBehind()
+
     t0 = time.monotonic()
     n = 0
+    dropping = 0            # readings dropped in the current overflow
     try:
         while not stop.is_set():
             # Checked before every read, not only after a good one: a sensor
@@ -776,7 +832,7 @@ def main(argv=None):
             try:
                 spec, inttime, sat = sensor.read_spectrum()
             except TimeoutError as e:
-                print(f"  ! {e}", file=sys.stderr, flush=True)
+                say(f"  ! {e}", file=sys.stderr, flush=True)
                 continue
             ts = time.time_ns()
             calibrated = None
@@ -787,41 +843,49 @@ def main(argv=None):
                 # would over-subtract at long integrations.
                 calibrated = cal.apply(spec, integration_time_ms=inttime,
                                        cap_id=args.cap_id)
-            writer.write(calibrated if baking else spec,
-                         is_saturated=sat, integration_time_ms=inttime,
-                         timestamp_ns=ts)
-            if csv_out is not None:
-                _vals = calibrated if csv_calibrated else spec
-                if not _csv_header_written:
-                    # Raw: the point count is only known once a
-                    # frame has arrived, so the column row waits for
-                    # one rather than guessing 135.
-                    _csv_header_written = True
-                    csv_out.writerow(
-                        ["timestamp_utc", "timestamp_ns",
-                         "integration_time_ms", "saturated",
-                         "calibrated", "units"]
-                        + [f"idx_{i}" for i in range(len(_vals))])
-                csv_out.writerow(
-                    [datetime.fromtimestamp(ts / 1e9,
-                                            timezone.utc).isoformat(
-                        timespec="milliseconds"),
-                     ts, inttime, int(bool(sat)), int(csv_calibrated),
-                     "W/m^2/nm" if csv_calibrated else "counts"]
-                    + [f"{v:.6g}" for v in _vals])
+            if files.submit(_store, spec, inttime, sat, ts, calibrated):
+                if dropping:
+                    say(f"  disk caught up: {dropping} reading(s) were "
+                        f"lost while it was stalled", file=sys.stderr,
+                        flush=True)
+                    dropping = 0
+            else:
+                if not dropping:
+                    say(f"! the disk is {files.backlog} readings behind; "
+                        f"new readings are being DROPPED until it catches "
+                        f"up", file=sys.stderr, flush=True)
+                dropping += 1
             n += 1
             if n % 10 == 0:
-                print(f"  {n} readings ...", flush=True)
+                _wait = files.backlog
+                say(f"  {n} readings ..."
+                    + (f" ({_wait} waiting for the disk)"
+                       if _wait > 10 else ""), flush=True)
             if args.frames and n >= args.frames:
                 break
     finally:
-        writer.close()
-        if csv_fh is not None:
-            csv_fh.close()
         sensor.close()
-        print(f"Stopped. Wrote {n} readings to {os.path.abspath(out)}")
-        if csv_path:
-            print(f"                    and {os.path.abspath(csv_path)}")
+        say.close()
+        if files.backlog:
+            print(f"  writing {files.backlog} queued reading(s) to disk ...",
+                  flush=True)
+        try:
+            files.close()
+        finally:
+            print(f"Stopped. Wrote {writer.record_count} readings to "
+                  f"{os.path.abspath(out)}")
+            if csv_path:
+                print(f"                    and {os.path.abspath(csv_path)}")
+            if files.dropped:
+                print(f"  ! {files.dropped} of {n} readings were DROPPED: "
+                      f"the disk stalled for longer than "
+                      f"{files.max_items} readings could wait",
+                      file=sys.stderr, flush=True)
+            elif files.slowest_commit_s >= 1.0:
+                print(f"  (the disk was slow -- one commit took "
+                      f"{files.slowest_commit_s:.1f} s and up to "
+                      f"{files.max_backlog} readings waited for it -- but "
+                      f"no reading was lost)")
     return 0
 
 
