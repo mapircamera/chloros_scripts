@@ -819,14 +819,19 @@ class _FakeNode:
     def max(self):
         return self._nm._max.get(self._name, 0)
 
+    @property
+    def min(self):
+        return self._nm._min.get(self._name, 0)
+
     def execute(self):
         self._nm._writes.append((self._name, "<EXEC>"))
 
 
 class _FakeNodemap:
-    def __init__(self, vals=None, maxes=None, missing=()):
+    def __init__(self, vals=None, maxes=None, missing=(), mins=None):
         self._vals = dict(vals or {})
         self._max = dict(maxes or {})
+        self._min = dict(mins or {})
         self._missing = set(missing)
         self._writes = []
 
@@ -1211,6 +1216,103 @@ def test_shared_link():
     check("...the shot is reported lost and the next one is saved",
           len(written) == 1 and isinstance(res, dict) and res.get("lost") == 1,
           f"{len(written)} written, {res!r}")
+
+
+def test_link_pacing():
+    """Pacing another program left on a camera (Jetson rig, 2026-10-20).
+
+    Chloros paces an array by giving every camera a packet delay (GevSCPD;
+    405454 ns on the rig) and, for bandwidth splitting, a link throughput
+    limit -- and both stay on the camera after Chloros lets go. The script
+    never wrote either, so it inherited them: one camera fell from 12.67 fps
+    to 2.66 and four cable-synced cameras from about 3.6 to 1.80. The script
+    keeps frames apart with the transmission stagger, so it now sends each
+    frame at full link speed: the throughput limit off (the factory
+    default) and the packet delay it is given (0 unless --packet-delay-ns).
+    """
+    print("\n-- link pacing left on a camera by another program --")
+    img = (np.random.rand(8, 8) * 4095).astype(np.uint16)
+
+    def paced(sn="214701173", scpd=405454, mode="On"):
+        nm = _FakeNodemap({"DeviceSerialNumber": sn, "DeviceUserID": "M3C-L41-FRGN",
+                           "GevSCPD": scpd, "DeviceLinkThroughputLimitMode": mode,
+                           "TriggerArmed": True},
+                          {"Width": 8, "Height": 8, "GevSCPD": 12748056},
+                          mins={"GevSCPD": 0})
+        cam = C.LatticeCamera(_FakeDevice(nm, img)); cam.identify()
+        return cam
+
+    def final(cam, name):
+        return cam.dev.nodemap._vals.get(name)
+
+    # 1. The helper: both pacing nodes, in an order the camera accepts.
+    cam = paced()
+    notes, err = [], None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            notes = C.configure_link_pacing([cam])
+    except Exception as e:
+        err = e
+    check("pacing left on a camera is cleared (packet delay 0, no throughput limit)",
+          err is None and final(cam, "GevSCPD") == 0
+          and final(cam, "DeviceLinkThroughputLimitMode") == "Off",
+          repr(err) if err else f"GevSCPD={final(cam, 'GevSCPD')} "
+          f"mode={final(cam, 'DeviceLinkThroughputLimitMode')}")
+    seq = _writes_seq(cam.dev)
+    def at(w): return seq.index(w) if w in seq else -1
+    check("...the throughput limit goes off BEFORE the packet delay is written",
+          0 <= at("DeviceLinkThroughputLimitMode=Off") < at("GevSCPD=0"), str(seq))
+    check("...and the run is told what was cleared",
+          len(notes) == 1 and "214701173" in notes[0] and "405454" in notes[0],
+          repr(notes))
+
+    cam = paced(scpd=0, mode="Off")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            notes = C.configure_link_pacing([cam])
+        ok, detail = notes == [], repr(notes)
+    except Exception as e:
+        ok, detail = False, repr(e)
+    check("a camera already at full speed gets no note", ok, detail)
+
+    cams = [paced(sn="1"), paced(sn="2")]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            C.configure_link_pacing(cams[:1], packet_delay_ns=1000)
+            C.configure_link_pacing(cams[1:], packet_delay_ns=99_999_999)
+        got = [final(c, "GevSCPD") for c in cams]
+        ok, detail = got == [1000, 12748056], f"GevSCPD {got}"
+    except Exception as e:
+        ok, detail = False, repr(e)
+    check("an explicit packet delay is written, clamped to the camera's range", ok, detail)
+
+    # 2. main() applies it on every run, before any frame is taken.
+    cam = paced()
+    seen = {}
+    real = (C._load_system, C.open_cameras, C.capture_loop)
+    class _Sys:
+        def destroy_device(self): pass
+    def fake_loop(ordered, mode, args, stop):
+        seen["GevSCPD"] = final(ordered[0], "GevSCPD")
+        seen["mode"] = final(ordered[0], "DeviceLinkThroughputLimitMode")
+        return {"lost": 0}
+    C._load_system = lambda: _Sys()
+    C.open_cameras = lambda system, wanted=None, model=None: [cam]
+    C.capture_loop = fake_loop
+    out, err = io.StringIO(), None
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            C.main(["--sync", "software", "--frames", "1",
+                    "--output-dir", os.path.join(OUT, "cam_pacing")])
+    except BaseException as e:
+        err = e
+    finally:
+        C._load_system, C.open_cameras, C.capture_loop = real
+    check("a capture run clears the pacing before its first frame",
+          err is None and seen == {"GevSCPD": 0, "mode": "Off"},
+          repr(err) if err else repr(seen))
+    check("...and says so", "405454" in out.getvalue(),
+          out.getvalue().strip().splitlines()[-1] if out.getvalue().strip() else "(silent)")
 
 
 def test_offline_calibration():
@@ -2446,6 +2548,7 @@ def main():
     test_camera_capture_flow()
     test_camera_frame_metadata()
     test_shared_link()
+    test_link_pacing()
     test_offline_calibration()
     test_cap_declaration()
     test_set_device_cap()

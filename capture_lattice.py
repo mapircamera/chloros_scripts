@@ -462,6 +462,51 @@ def configure_stagger(ordered_cams, stagger_ms):
         c._try_set("GevSCFTD", int(round(i * stagger_ms * 1e6)))
 
 
+def configure_link_pacing(cams, packet_delay_ns=0):
+    """Send each frame at full link speed, whatever pacing was left behind.
+
+    Chloros paces an array by giving every camera an inter-packet delay
+    (GevSCPD) and, to split bandwidth, a link throughput limit -- and both
+    stay on the camera after Chloros disconnects. Inherited, they throttled
+    this script about 5x (Jetson rig, 2026-10-20: one camera 2.66 fps at
+    Chloros's 405454 ns packet delay, 12.67 fps without it). Cameras sharing
+    a link are kept apart by the transmission stagger (configure_stagger),
+    not by pacing, so the throughput limit goes off -- its factory default
+    -- and the packet delay is set to ``packet_delay_ns``, clamped to the
+    camera's range. The limit goes off first: with it on, the camera refuses
+    the GevSCPD write.
+
+    Returns one note per camera whose pacing this changed.
+    """
+    notes = []
+    for c in cams:
+        changed = []
+        try:
+            old_mode = str(c._get("DeviceLinkThroughputLimitMode"))
+        except Exception:
+            old_mode = None                     # firmware without the node
+        if old_mode is not None:
+            c._try_set("DeviceLinkThroughputLimitMode", "Off")
+            if old_mode == "On":
+                changed.append("throughput limit On -> Off")
+        try:
+            node = c.dev.nodemap.get_node("GevSCPD")
+            old_delay = int(node.value)
+        except Exception:
+            continue                            # no packet delay to set
+        delay = int(packet_delay_ns)
+        try:
+            delay = max(int(node.min), min(int(node.max), delay))
+        except Exception:
+            pass
+        c._try_set("GevSCPD", delay)
+        if old_delay != delay:
+            changed.insert(0, f"packet delay {old_delay} -> {delay} ns")
+        if changed:
+            notes.append(f"{c.serial}: " + ", ".join(changed))
+    return notes
+
+
 def _fire(ordered_cams, mode, arm_s, timeout_ms):
     """Trigger one shot; return the cameras that should now deliver a frame.
 
@@ -597,6 +642,14 @@ def main(argv=None):
                    help="cable sync: slave trigger-input deglitch in "
                         f"microseconds (default {TRIGGER_DEGLITCH_US:g}, as "
                         "Chloros uses; 0 leaves the camera's own setting)")
+    p.add_argument("--packet-delay-ns", type=int, default=0,
+                   help="delay each camera puts between the packets of a "
+                        "frame (GevSCPD, ns). Default 0: full link speed -- "
+                        "the transmission stagger keeps cameras apart. Written "
+                        "on every run, with the link throughput limit turned "
+                        "off, so pacing another program left on a camera "
+                        "(Chloros leaves its array pacing) cannot throttle "
+                        "this one")
     p.add_argument("--output-dir", help="where to write TIFFs (default: .)")
     args = p.parse_args(argv)
 
@@ -616,6 +669,11 @@ def main(argv=None):
                                  deglitch_us=args.deglitch_us)
     print(f"Sync mode: {mode}"
           + (f" (master {ordered[0].serial})" if mode == "cable" else ""))
+    notes = configure_link_pacing(ordered, args.packet_delay_ns)
+    if notes:
+        print("Cleared link pacing another program left on the camera(s):")
+        for n in notes:
+            print(f"  {n}")
     stagger = (args.stagger_ms if args.stagger_ms is not None
                else auto_stagger_ms(ordered))
     configure_stagger(ordered, stagger)

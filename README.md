@@ -117,6 +117,7 @@ python capture_lattice.py --stagger-ms 0
 | `--frames N` / `--duration S` / `--interval S` | stop after N shots / S seconds / wait S between shots | until Ctrl-C |
 | `--stagger-ms MS` | camera *i* sends each frame *i* × MS after exposing (see below) | one frame's 1 GbE wire time plus margin (65 ms full-res 12-bit) with 2+ cameras |
 | `--deglitch-us US` | cable sync: slave trigger-input deglitch | `5` |
+| `--packet-delay-ns NS` | delay each camera puts between the packets of a frame (`GevSCPD`; see below) | `0` (full link speed) |
 | `--output-dir DIR` | where to write TIFFs | `.` |
 
 **Hardware sync.** With `--sync cable`, the master camera is software-triggered
@@ -147,6 +148,14 @@ margin: 65 ms for a full-resolution 12-bit frame. That clears both the 55 ms
 measured through a jumbo-frame switch and the 60 ms needed without jumbo frames
 (1500-byte packets, e.g. PoE injectors and splitters with no switch). Behind a
 10 GbE uplink, pass `--stagger-ms 0` for full speed.
+
+**Pacing left on a camera is cleared.** Chloros paces an array by giving each
+camera an inter-packet delay (`GevSCPD`) and, to split bandwidth, a link
+throughput limit, and both stay on the camera after Chloros disconnects.
+Inherited, they cut this script's rate about fivefold: one camera ran at 2.66
+fps instead of 12.67. Since the stagger already keeps cameras apart, every run
+turns the throughput limit off (the factory default) and sets the packet delay
+to `--packet-delay-ns` (0), and says so when it changed either.
 
 **An incomplete frame is never saved.** If packets are lost anyway, that frame
 is dropped and named on stderr, the summary counts it, and the script exits
