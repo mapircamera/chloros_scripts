@@ -160,6 +160,11 @@ def write_lattice_raw_tiff(path, pixels, *, model, serial,
         offset' -- the same contract the MAPIR CM5 hub stamps (fw >= 1.4.1).
         A NAIVE `when` is taken as host-local time and declared as such.
 
+    The file is written to ``<path>.part`` and renamed into place, so it is
+    whole under its name or not there: a write the disk cuts short (ENOSPC)
+    raises and leaves nothing behind, rather than a truncated TIFF Chloros
+    would import as a frame.
+
     Note on compression: the TIFF is written UNCOMPRESSED. Pillow's in-TIFF
     DEFLATE/LZW paths go through libtiff, which cannot co-write the EXIF
     sub-IFD this contract needs (libtiff drops tag 34665), so we keep pixels
@@ -203,7 +208,16 @@ def write_lattice_raw_tiff(path, pixels, *, model, serial,
     # EXIF sub-IFD (exposure/ISO/timestamps) only survives Pillow's
     # uncompressed encoder; any compression routes through libtiff and drops
     # tag 34665.
-    img.save(path, format="TIFF", exif=exif.tobytes())
+    tmp = path + ".part"
+    try:
+        img.save(tmp, format="TIFF", exif=exif.tobytes())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 

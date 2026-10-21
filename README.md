@@ -155,12 +155,19 @@ throughput limit, and both stay on the camera after Chloros disconnects.
 Inherited, they cut this script's rate about fivefold: one camera ran at 2.66
 fps instead of 12.67. Since the stagger already keeps cameras apart, every run
 turns the throughput limit off (the factory default) and sets the packet delay
-to `--packet-delay-ns` (0), and says so when it changed either.
+to `--packet-delay-ns` (0). It says so when it cleared real pacing; the
+cameras' own 80 ns delay is set to 0 without comment.
 
 **An incomplete frame is never saved.** If packets are lost anyway, that frame
 is dropped and named on stderr, the summary counts it, and the script exits
 with status 1. It is not written as a TIFF: a partial frame has rows of zeros
 that would otherwise reach Chloros as data.
+
+**A full disk ends the run cleanly.** Every TIFF is written to `<name>.part`
+and renamed into place, so a frame is whole under its name or not there. When
+a write fails (the disk is full, most often: three cameras write ~19 MB a
+shot), the run stops on that frame, the frames already saved stand, the
+summary says why it stopped, and the script exits with status 1.
 
 **Slaves are deglitched.** The shared M8 line chatters while the master holds
 it, and an unfiltered slave fires on every glitch, producing frames nobody

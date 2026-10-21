@@ -1275,6 +1275,28 @@ def test_link_pacing():
         ok, detail = False, repr(e)
     check("a camera already at full speed gets no note", ok, detail)
 
+    # The M3Cs ship at an 80 ns packet delay: a camera setting, not pacing.
+    # It still goes to 0, but nothing "another program left" is reported
+    # -- on fresh cameras the note fired on every run (Jetson rig, 10-21).
+    cam = paced(scpd=80, mode="Off")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            notes = C.configure_link_pacing([cam])
+        ok = notes == [] and final(cam, "GevSCPD") == 0
+        detail = f"{notes!r}, GevSCPD={final(cam, 'GevSCPD')}"
+    except Exception as e:
+        ok, detail = False, repr(e)
+    check("a camera at its 80 ns default gets no note (and still goes to 0)", ok, detail)
+    cam = paced(scpd=80, mode="Off")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            notes = C.configure_link_pacing([cam], packet_delay_ns=1000)
+        ok = notes == [] and final(cam, "GevSCPD") == 1000
+        detail = f"{notes!r}, GevSCPD={final(cam, 'GevSCPD')}"
+    except Exception as e:
+        ok, detail = False, repr(e)
+    check("...nor when the user asks for a delay on it", ok, detail)
+
     cams = [paced(sn="1"), paced(sn="2")]
     try:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1313,6 +1335,148 @@ def test_link_pacing():
           repr(err) if err else repr(seen))
     check("...and says so", "405454" in out.getvalue(),
           out.getvalue().strip().splitlines()[-1] if out.getvalue().strip() else "(silent)")
+
+    cam = paced(scpd=80, mode="Off")
+    real = (C._load_system, C.open_cameras, C.capture_loop)
+    C._load_system = lambda: _Sys()
+    C.open_cameras = lambda system, wanted=None, model=None: [cam]
+    C.capture_loop = lambda ordered, mode, args, stop: {"lost": 0}
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            C.main(["--sync", "software", "--frames", "1",
+                    "--output-dir", os.path.join(OUT, "cam_pacing")])
+    except BaseException as e:
+        out.write(repr(e))
+    finally:
+        C._load_system, C.open_cameras, C.capture_loop = real
+    check("a run on cameras at their default prints no pacing note",
+          "Cleared link pacing" not in out.getvalue(),
+          next((l for l in out.getvalue().splitlines() if "pacing" in l or "delay" in l), ""))
+
+
+def test_disk_full():
+    """The disk fills mid-capture (Jetson rig, 2026-10-19).
+
+    Three cameras write about 19 MB a shot, and a run filled / to 100%. The
+    TIFF write raised ENOSPC out of the capture loop: a traceback, the run's
+    summary never printed, and a truncated TIFF left under the frame's name
+    -- a file Chloros would import as a frame. Now each TIFF is written to
+    ``<name>.part`` and renamed into place (as Chloros does), so a frame is
+    whole under its name or not there, and a failed write ends the run
+    cleanly: the frames already saved stand, the run says why it stopped,
+    and the exit status says the capture was cut short.
+    """
+    print("\n-- a full disk mid-capture --")
+    import errno
+    import threading
+    import mapir_metadata as M
+    img = (np.random.rand(8, 8) * 4095).astype(np.uint16)
+
+    # 1. The writer: a write the disk cuts short leaves nothing behind.
+    d = os.path.join(OUT, "cam_diskfull_writer"); os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "capture_1_0001_20261021_000000_000000.tiff")
+    real_save = M.Image.Image.save
+    def short_save(self, fp, *a, **k):
+        with open(fp, "wb") as fh:
+            fh.write(b"II*\0" + b"\0" * 100)            # a truncated TIFF
+        raise OSError(errno.ENOSPC, "No space left on device")
+    M.Image.Image.save = short_save
+    err = None
+    try:
+        M.write_lattice_raw_tiff(path, img, model="LATT-M3C-L41-FRGN",
+                                 serial="1", exposure_s=0.001)
+    except OSError as e:
+        err = e
+    finally:
+        M.Image.Image.save = real_save
+    left = sorted(os.listdir(d))
+    check("a frame the disk cut short is not left under its name",
+          not os.path.exists(path), str(left))
+    check("...nor as a partial file beside it", left == [], str(left))
+    check("...and the write still fails loudly (ENOSPC)",
+          isinstance(err, OSError) and err.errno == errno.ENOSPC, repr(err))
+
+    # 2. What counts as a full disk -- numpy's short write carries no errno.
+    try:
+        ok = (C.is_disk_full(OSError(errno.ENOSPC, "No space left on device"))
+              and C.is_disk_full(OSError("6291456 requested and 4096 written"))
+              and not C.is_disk_full(OSError(errno.EACCES, "Permission denied")))
+        detail = ""
+    except Exception as e:
+        ok, detail = False, repr(e)
+    check("ENOSPC and an errno-less short write count as a full disk; EACCES does not",
+          ok, detail)
+
+    # 3. The capture loop and main(): stop cleanly on the frame that failed.
+    class _Args:
+        frames = 5; duration = 0; interval = 0; timeout_ms = 500
+    def run(fail_on, exc):
+        nm = _FakeNodemap({"DeviceSerialNumber": "214701173",
+                           "DeviceUserID": "M3C-L41-FRGN", "TriggerArmed": True},
+                          {"Width": 8, "Height": 8})
+        cam = C.LatticeCamera(_FakeDevice(nm, img, chunks={"ChunkExposureTime": 1000.0,
+                                                           "ChunkGain": 0.0}))
+        cam.identify(); cam.role = "single"
+        args = _Args(); args.output_dir = os.path.join(OUT, f"cam_diskfull_{fail_on}")
+        calls = {"n": 0}
+        real_write = C.write_lattice_raw_tiff
+        def write(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == fail_on:
+                raise exc
+            return real_write(*a, **k)
+        C.write_lattice_raw_tiff = write
+        out, res, err = io.StringIO(), None, None
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                res = C.capture_loop([cam], "software", args, threading.Event())
+        except BaseException as e:
+            err = e
+        finally:
+            C.write_lattice_raw_tiff = real_write
+        written = sorted(f for f in os.listdir(args.output_dir) if f.endswith(".tiff")) \
+            if os.path.isdir(args.output_dir) else []
+        return res, err, out.getvalue(), written
+
+    res, err, text, written = run(3, OSError(errno.ENOSPC, "No space left on device"))
+    check("a full disk ends the run without a traceback", err is None, repr(err))
+    check("...keeping the frames already saved, and taking no more",
+          len(written) == 2 and isinstance(res, dict) and res.get("saved") == 2,
+          f"{len(written)} written, {res!r}")
+    check("...saying the disk is full", "disk is full" in text.lower(),
+          text.strip().splitlines()[-1] if text.strip() else "(silent)")
+    check("...and telling its caller the capture was cut short",
+          isinstance(res, dict) and bool(res.get("write_error")), repr(res))
+
+    res, err, text, written = run(2, OSError(errno.EACCES, "Permission denied"))
+    check("another write error also stops cleanly and names it",
+          err is None and len(written) == 1 and "Permission denied" in text,
+          repr(err) if err else (text.strip().splitlines()[-1] if text.strip() else ""))
+
+    nm = _FakeNodemap({"DeviceSerialNumber": "214701173", "DeviceUserID": "M3C-L41-FRGN",
+                       "TriggerArmed": True}, {"Width": 8, "Height": 8})
+    cam = C.LatticeCamera(_FakeDevice(nm, img, chunks={"ChunkExposureTime": 1000.0,
+                                                       "ChunkGain": 0.0}))
+    class _Sys:
+        def destroy_device(self): pass
+    real = (C._load_system, C.open_cameras, C.write_lattice_raw_tiff)
+    C._load_system = lambda: _Sys()
+    C.open_cameras = lambda system, wanted=None, model=None: [cam]
+    def full(*a, **k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    C.write_lattice_raw_tiff = full
+    rc, err = None, None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = C.main(["--sync", "software", "--frames", "2",
+                         "--output-dir", os.path.join(OUT, "cam_diskfull_main")])
+    except BaseException as e:
+        err = e
+    finally:
+        C._load_system, C.open_cameras, C.write_lattice_raw_tiff = real
+    check("a run the disk cut short exits non-zero, without a traceback",
+          err is None and rc == 1, repr(err) if err else f"exit {rc}")
 
 
 def test_offline_calibration():
@@ -2549,6 +2713,7 @@ def main():
     test_camera_frame_metadata()
     test_shared_link()
     test_link_pacing()
+    test_disk_full()
     test_offline_calibration()
     test_cap_declaration()
     test_set_device_cap()

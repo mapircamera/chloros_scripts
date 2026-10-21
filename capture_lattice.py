@@ -35,8 +35,10 @@ Examples
 """
 
 import argparse
+import errno
 import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -462,6 +464,13 @@ def configure_stagger(ordered_cams, stagger_ms):
         c._try_set("GevSCFTD", int(round(i * stagger_ms * 1e6)))
 
 
+#: A packet delay at or below this is the camera's own setting, not pacing:
+#: the M3Cs ship at 80 ns, while real pacing (Chloros's array pacing left
+#: 405454 ns) is microseconds per packet. Such a delay is still written; it
+#: just isn't reported as pacing another program left.
+PACING_NOTE_MIN_NS = 1000
+
+
 def configure_link_pacing(cams, packet_delay_ns=0):
     """Send each frame at full link speed, whatever pacing was left behind.
 
@@ -476,7 +485,8 @@ def configure_link_pacing(cams, packet_delay_ns=0):
     camera's range. The limit goes off first: with it on, the camera refuses
     the GevSCPD write.
 
-    Returns one note per camera whose pacing this changed.
+    Returns one note per camera whose pacing this cleared. A delay of
+    PACING_NOTE_MIN_NS or less is the camera's own setting and gets none.
     """
     notes = []
     for c in cams:
@@ -500,11 +510,30 @@ def configure_link_pacing(cams, packet_delay_ns=0):
         except Exception:
             pass
         c._try_set("GevSCPD", delay)
-        if old_delay != delay:
+        if old_delay != delay and old_delay > PACING_NOTE_MIN_NS:
             changed.insert(0, f"packet delay {old_delay} -> {delay} ns")
         if changed:
             notes.append(f"{c.serial}: " + ", ".join(changed))
     return notes
+
+
+#: errnos of a write the disk (or a quota) had no room for.
+_DISK_FULL_ERRNOS = frozenset(
+    e for e in (errno.ENOSPC, getattr(errno, "EDQUOT", None)) if e)
+#: numpy's short write when the disk takes fewer bytes than it was given:
+#: an OSError with NO errno.
+_SHORT_WRITE = re.compile(r"\d+ requested and \d+ written")
+
+
+def is_disk_full(exc):
+    """True for a write that failed because the disk (or quota) is full --
+    the same rule Chloros uses (lattice_cam/capture.py)."""
+    if not isinstance(exc, OSError):
+        return False
+    if getattr(exc, "errno", None) in _DISK_FULL_ERRNOS:
+        return True
+    return (getattr(exc, "errno", None) is None
+            and bool(_SHORT_WRITE.fullmatch(str(exc))))
 
 
 def _fire(ordered_cams, mode, arm_s, timeout_ms):
@@ -543,8 +572,13 @@ def _fire(ordered_cams, mode, arm_s, timeout_ms):
 
 def capture_loop(ordered_cams, mode, args, stop):
     """Capture until frames / duration / Ctrl-C. Returns {"shots", "saved",
-    "lost"}: lost counts frames that were not saved -- incomplete, timed
-    out, or never triggered."""
+    "lost", "write_error"}: lost counts frames that were not saved --
+    incomplete, timed out, never triggered, or cut off by a failed write.
+
+    A frame that cannot be written (the disk is full, most likely: three
+    cameras write ~19 MB a shot) ends the run there, cleanly: the frames
+    already saved are whole (write_lattice_raw_tiff renames each into place),
+    the run says why it stopped, and ``write_error`` tells the caller."""
     out_dir = args.output_dir or "."
     os.makedirs(out_dir, exist_ok=True)
     for c in ordered_cams:
@@ -553,12 +587,13 @@ def capture_loop(ordered_cams, mode, args, stop):
     seq = 1
     saved = 0
     lost = 0
+    write_error = None
     arm_s = args.timeout_ms / 1000.0
     try:
         while not stop.is_set():
             shot_time = datetime.now(timezone.utc)
             fired = _fire(ordered_cams, mode, arm_s, args.timeout_ms)
-            for c in ordered_cams:
+            for i, c in enumerate(ordered_cams):
                 if c not in fired:
                     lost += 1
                     continue
@@ -576,10 +611,21 @@ def capture_loop(ordered_cams, mode, args, stop):
                     continue
                 exp_s, iso = c.frame_exposure_iso(info)
                 fn = lattice_capture_filename(c.serial, seq, when=shot_time)
-                write_lattice_raw_tiff(os.path.join(out_dir, fn), arr,
-                                       model=c.model, serial=c.serial,
-                                       exposure_s=exp_s, iso=iso, when=shot_time)
+                try:
+                    write_lattice_raw_tiff(os.path.join(out_dir, fn), arr,
+                                           model=c.model, serial=c.serial,
+                                           exposure_s=exp_s, iso=iso,
+                                           when=shot_time)
+                except OSError as e:
+                    # This frame and the rest of the shot's are not saved.
+                    lost += sum(1 for x in ordered_cams[i:] if x in fired)
+                    write_error = ("the disk is full" if is_disk_full(e)
+                                   else f"could not write {fn}: {e}")
+                    break
                 saved += 1
+            if write_error:
+                seq += 1
+                break
             if seq % 10 == 0:
                 print(f"  {seq} shots ({saved} frames) ...", flush=True)
             seq += 1
@@ -597,11 +643,16 @@ def capture_loop(ordered_cams, mode, args, stop):
             c.stop()
         print(f"Stopped. Saved {saved} frames across {seq - 1} shots to "
               f"{os.path.abspath(out_dir)}")
-        if lost:
+        if write_error:
+            print(f"  ! Stopped early: {write_error}. The {saved} frame(s) "
+                  f"saved are complete; {lost} frame(s) NOT saved.",
+                  file=sys.stderr, flush=True)
+        elif lost:
             print(f"  ! {lost} frame(s) NOT saved (incomplete, timed out or "
                   f"not triggered). Several cameras on one 1 GbE link need "
                   f"--stagger-ms; see the README.", file=sys.stderr, flush=True)
-    return {"shots": seq - 1, "saved": saved, "lost": lost}
+    return {"shots": seq - 1, "saved": saved, "lost": lost,
+            "write_error": write_error}
 
 
 def main(argv=None):
@@ -690,9 +741,9 @@ def main(argv=None):
             system.destroy_device()
         except Exception:
             pass
-    # Non-zero when any frame was lost, so a script driving this one can
-    # tell a complete capture from a partial one.
-    return 1 if result["lost"] else 0
+    # Non-zero when any frame was lost or a write stopped the run, so a
+    # script driving this one can tell a complete capture from a partial one.
+    return 1 if result["lost"] or result.get("write_error") else 0
 
 
 if __name__ == "__main__":
